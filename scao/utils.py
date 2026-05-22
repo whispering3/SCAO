@@ -3,10 +3,11 @@ Utility functions for SCAO: matrix operations, rank selection, Newton-Schulz ite
 """
 
 from __future__ import annotations
-import math
+
+from typing import cast
+
 import torch
 from torch import Tensor
-
 
 # ---------------------------------------------------------------------------
 # Matrix root via Newton-Schulz iteration (faster than eigendecomposition for
@@ -55,7 +56,7 @@ def newton_schulz_root_inv(A: Tensor, steps: int = 10, eps: float = 1e-8) -> Ten
 
     # Scale back: (A/||A||)^{-1/4} = ||A||^{1/4} * A^{-1/4}
     scale = norm.pow(0.25)
-    return X2 * scale
+    return cast(Tensor, X2 * scale)
 
 
 def matrix_power_neg_quarter(
@@ -90,7 +91,7 @@ def matrix_power_neg_quarter(
     eigvals, eigvecs = torch.linalg.eigh(A)
     eigvals = eigvals.clamp(min=eps)
     inv_quarter = eigvals.pow(-0.25)
-    return (eigvecs * inv_quarter.unsqueeze(0)) @ eigvecs.T
+    return cast(Tensor, (eigvecs * inv_quarter.unsqueeze(0)) @ eigvecs.T)
 
 
 def low_rank_matrix_power_neg_quarter(

@@ -107,13 +107,15 @@ __global__ void tiled_AB_kernel(
 //     G_out = G + U_l @ delta @ U_r^T
 //
 //   Each CUDA block handles one (TILE_M, TILE_N) output tile of G_out.
-//   P (k×k) is materialised in shared memory (fits for k≤128: 128²×4=64KB).
+//   P (k×k) is materialised in shared memory. Keep k≤32 so the kernel compiles
+//   on T4/V100 class GPUs with a 48KB per-block shared-memory limit, including
+//   the double-specialized template instantiated by PyTorch dispatch.
 //   Requires k ≤ MAX_K and (TILE_M, TILE_N) = (TILE, TILE).
 //
 //   Memory bandwidth: reads G once, writes G_out once.  Avoids the two
 //   large (m,n) intermediates that sequential U_l@P@U_r^T requires.
 // ---------------------------------------------------------------------------
-#define MAX_K 128
+#define MAX_K 32
 
 template <typename scalar_t>
 __global__ void fused_kronecker_precond_kernel(
@@ -297,7 +299,7 @@ torch::Tensor low_rank_precond_mm_cuda(
 
 // Full fused identity+correction Kronecker preconditioner
 // G_out = G + U_l @ ((s_l⊗s_r - 1) * (U_l^T@G@U_r)) @ U_r^T
-// Only valid for k ≤ MAX_K (128).  Falls back to Python if k > 128.
+// Only valid for k ≤ MAX_K.  Python falls back to pure PyTorch if k is larger.
 torch::Tensor fused_kronecker_precond_cuda(
     torch::Tensor U_l,        // (m, k)
     torch::Tensor s_l_inv4,   // (k,)
@@ -391,7 +393,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "2-pass tiled low-rank preconditioned matmul: U diag(s) U^T G (CUDA)");
     m.def("fused_kronecker_precond",
           &fused_kronecker_precond_cuda,
-          "Fused Kronecker identity+correction precond step (CUDA, k<=128)");
+          "Fused Kronecker identity+correction precond step (CUDA, k<=32)");
     m.def("int8_ema_update",
           &int8_ema_update_cuda,
           "Quantized EMA update: dequantize, rho*old+alpha*new, requantize (CUDA)");

@@ -26,12 +26,10 @@ SCAO: Sparse Curvature-Aware Adaptive Optimization for Large-Scale Models
 Zenodo 2026
 """
 
-from .optimizer import (
-    SCAO, scao_sub1b, scao_1b, scao_3b, scao_7b, scao_40b, scao_125b
-)
-from .preconditioner import SparsePreconditioner
-from .utils import matrix_power_neg_quarter, adaptive_rank
 from . import logging as scao_logging
+from .optimizer import SCAO, scao_1b, scao_3b, scao_7b, scao_40b, scao_125b, scao_sub1b
+from .preconditioner import SparsePreconditioner
+from .utils import adaptive_rank, matrix_power_neg_quarter
 
 __version__ = "0.2.0"
 __author__ = "Danilo Souza"

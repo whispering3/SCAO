@@ -47,21 +47,19 @@ import gc
 import json
 import math
 import os
+import random
 import sys
 import time
 import tracemalloc
 from contextlib import contextmanager
-from dataclasses import dataclass, asdict, field
-from typing import Iterator, Optional
+from dataclasses import asdict, dataclass, field
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 from scao import SCAO
-
 
 # ===========================================================================
 # Profiling helpers
@@ -180,7 +178,7 @@ class RunResult:
 
 def _seed_everything(seed: int) -> None:
     torch.manual_seed(seed)
-    import random; random.seed(seed)
+    random.seed(seed)
 
 
 def make_markov_text(
@@ -380,7 +378,10 @@ class LinearModel(nn.Module):
 
 class DiagonalShampoo(torch.optim.Optimizer):
     def __init__(self, params, lr=1e-3, eps=1e-8, weight_decay=0.0, rho=0.999):
-        super().__init__(params, dict(lr=lr, eps=eps, weight_decay=weight_decay, rho=rho))
+        super().__init__(
+            params,
+            {"lr": lr, "eps": eps, "weight_decay": weight_decay, "rho": rho},
+        )
 
     @torch.no_grad()
     def step(self, closure=None):
@@ -413,7 +414,13 @@ def make_optimizer(name: str, params, lr: float, steps: int,
             warmup_steps=warmup_steps,
             precond_freq=max(5, steps // 80),
             min_precond_updates=5,
-            k_min=4, k_max=32, tau=None,
+            k_min=4, k_max=32,
+            tau=1.0,
+            sparsity=0.0,
+            noise_std_init=0.0,
+            lars_coeff=0.0,
+            lookahead_k=0,
+            adaptive_warmup=False,
         )
     if name == "diag_shampoo":
         return DiagonalShampoo(params, lr=lr * 3, weight_decay=0.01)
@@ -482,7 +489,7 @@ def run_lm(
     gc.collect()
     tracemalloc.start()
 
-    for step in range(1, steps + 1):
+    for _step in range(1, steps + 1):
         idx  = torch.randint(0, n_train, (batch_size,))
         xb   = train_x[idx]
         yb   = train_y[idx]
@@ -497,8 +504,7 @@ def run_lm(
         logits = model(xb)
         loss   = loss_fn(logits.reshape(-1, vocab), yb.reshape(-1))
         loss.backward()
-        if opt_name != "scao":
-            nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         opt.step()
         sched.step()
 
@@ -582,7 +588,7 @@ def run_regression(
     gc.collect()
     tracemalloc.start()
 
-    for step in range(1, steps + 1):
+    for _step in range(1, steps + 1):
         idx  = torch.randint(0, n_train, (batch_size,))
         xb, yb = train_x[idx], train_y[idx]
 
@@ -595,8 +601,7 @@ def run_regression(
         pred = model(xb)
         loss = loss_fn(pred, yb)
         loss.backward()
-        if opt_name != "scao":
-            nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         opt.step()
         sched.step()
 

@@ -1,3 +1,4 @@
+# mypy: ignore-errors
 """
 HuggingFace Transformers integration for SCAO
 ==============================================
@@ -40,7 +41,6 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
-import torch
 import torch.nn as nn
 
 if TYPE_CHECKING:
@@ -56,6 +56,7 @@ def get_scao_optimizer(
     training_args,
     scao_kwargs: dict | None = None,
     no_decay_names: tuple[str, ...] = ("bias", "LayerNorm.weight", "layer_norm.weight"),
+    num_training_steps: int | None = None,
 ):
     """
     Build a SCAO optimizer + learning-rate scheduler compatible with
@@ -69,9 +70,12 @@ def get_scao_optimizer(
         training_args: ``transformers.TrainingArguments`` instance
         scao_kwargs: additional SCAO hyperparameters (override defaults)
         no_decay_names: parameter name substrings exempt from weight decay
+        num_training_steps: explicit scheduler length. Required for an accurate
+            scheduler when ``training_args.max_steps`` is not set.
 
     Returns:
-        (optimizer, scheduler) tuple ready for ``Trainer(optimizers=...)``
+        (optimizer, scheduler) tuple ready for ``Trainer(optimizers=...)``.
+        The scheduler is ``None`` when the total step count is unknown.
 
     Example::
 
@@ -108,20 +112,24 @@ def get_scao_optimizer(
         {"params": no_decay_params, "weight_decay": 0.0},
     ]
 
-    defaults: dict[str, Any] = dict(
-        lr=training_args.learning_rate,
-        warmup_steps=int(getattr(training_args, "warmup_steps", 100)),
-    )
+    defaults: dict[str, Any] = {
+        "lr": training_args.learning_rate,
+        "warmup_steps": int(getattr(training_args, "warmup_steps", 100)),
+    }
     if scao_kwargs:
         defaults.update(scao_kwargs)
 
     optimizer = SCAO(param_groups, **defaults)
 
-    # Build HF-compatible LR scheduler
-    num_training_steps = getattr(training_args, "max_steps", -1)
-    if num_training_steps < 0:
-        # Estimate from epochs and dataset size if available
-        num_training_steps = 10_000  # safe default; user should override
+    # Build HF-compatible LR scheduler only when the total length is known.
+    # A hard-coded fallback silently distorts cosine/linear schedules on most
+    # real runs, so manual users must pass num_training_steps or max_steps.
+    if num_training_steps is None:
+        max_steps = int(getattr(training_args, "max_steps", -1))
+        num_training_steps = max_steps if max_steps > 0 else None
+
+    if num_training_steps is None:
+        return optimizer, None
 
     scheduler = get_scheduler(
         name=getattr(training_args, "lr_scheduler_type", "cosine"),

@@ -41,7 +41,6 @@ import sys
 import time
 import tracemalloc
 from dataclasses import dataclass
-from typing import Iterator
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
@@ -251,7 +250,10 @@ class DiagonalShampoo(torch.optim.Optimizer):
 
     def __init__(self, params, lr: float = 1e-3, eps: float = 1e-8,
                  weight_decay: float = 0.0, rho: float = 0.999) -> None:
-        super().__init__(params, dict(lr=lr, eps=eps, weight_decay=weight_decay, rho=rho))
+        super().__init__(
+            params,
+            {"lr": lr, "eps": eps, "weight_decay": weight_decay, "rho": rho},
+        )
 
     @torch.no_grad()
     def step(self, closure=None):
@@ -439,7 +441,7 @@ def run_single(
         grad_bytes  = param_bytes  # one gradient tensor per param (same size)
         opt_bytes = 0
         for state in optimizer.state.values():
-            for k, v in state.items():
+            for _k, v in state.items():
                 if isinstance(v, torch.Tensor):
                     opt_bytes += v.numel() * v.element_size()
                 elif hasattr(v, "memory_bytes"):
@@ -532,7 +534,7 @@ def main() -> None:
         warmup_steps = args.warmup   or min(200, steps // 5)
 
         print(f"\n{'=' * 72}")
-        print(f"  SCAO Multi-Scale Benchmark")
+        print("  SCAO Multi-Scale Benchmark")
         print(f"  Scale: {scale_key} ({cfg.label} params)  "
               f"d={cfg.d_model}  L={cfg.n_layers}  H={cfg.n_head}")
         print(f"  device={device}  steps={steps}  batch={batch_size}  seeds={seeds}")
@@ -572,8 +574,8 @@ def main() -> None:
                       f"t={r['total_time_s']:.1f}s")
 
     # --- Summary table ---
-    from collections import defaultdict
     import statistics
+    from collections import defaultdict
 
     # Group by (scale, optimizer) across seeds
     groups: dict[tuple, list[dict]] = defaultdict(list)

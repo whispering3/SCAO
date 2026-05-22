@@ -26,14 +26,14 @@ from __future__ import annotations
 
 import math
 import warnings
-from typing import Callable, Iterable, Optional
+from collections.abc import Callable, Iterable
+from typing import Any, cast
 
 import torch
 from torch import Tensor
 from torch.optim import Optimizer
 
 from .preconditioner import SparsePreconditioner, _broadcast_precond
-
 
 # ---------------------------------------------------------------------------
 # Gradient filters
@@ -45,7 +45,7 @@ class _SparseGradFilter:
     def __init__(self, sparsity: float = 0.7, ema: float = 0.99):
         self.sparsity = sparsity
         self.ema = ema
-        self.mag_ema: Optional[Tensor] = None
+        self.mag_ema: Tensor | None = None
 
     def __call__(self, grad: Tensor) -> Tensor:
         mag = grad.abs().detach()
@@ -126,7 +126,7 @@ class _AdaptiveWarmupScheduler:
         self.min_warmup = min_warmup
         self._prev_norm: float = float("inf")
         self._stable_count: int = 0
-        self._early_exit_step: Optional[int] = None
+        self._early_exit_step: int | None = None
 
     def update(self, step: int, avg_grad_norm: float) -> bool:
         """Returns True while still in warmup."""
@@ -303,20 +303,21 @@ class SCAO(Optimizer):
         if not (0.0 <= beta3 < 1.0):
             raise ValueError(f"Invalid beta3: {beta3}")
 
-        defaults = dict(
-            lr=lr, betas=betas, eps=eps, weight_decay=weight_decay,
-            precond_freq=precond_freq, epsilon_sparse=epsilon_sparse,
-            k_min=k_min, k_max=k_max, rho=rho, tau=tau,
-            warmup_steps=warmup_steps, blend_steps=blend_steps,
-            min_precond_updates=min_precond_updates,
-            max_precond_dim=max_precond_dim, use_newton_schulz=use_newton_schulz,
-            use_int8_ema=use_int8_ema, beta3=beta3, lars_coeff=lars_coeff,
-        )
+        defaults = {
+            "lr": lr, "betas": betas, "eps": eps, "weight_decay": weight_decay,
+            "precond_freq": precond_freq, "epsilon_sparse": epsilon_sparse,
+            "k_min": k_min, "k_max": k_max, "rho": rho, "tau": tau,
+            "warmup_steps": warmup_steps, "blend_steps": blend_steps,
+            "min_precond_updates": min_precond_updates,
+            "max_precond_dim": max_precond_dim, "use_newton_schulz": use_newton_schulz,
+            "use_int8_ema": use_int8_ema, "beta3": beta3, "lars_coeff": lars_coeff,
+        }
         super().__init__(params, defaults)
 
         self._precond_stream: torch.cuda.Stream | None = None
         if async_precond and torch.cuda.is_available():
             self._precond_stream = torch.cuda.Stream()
+        self._precond_async_pending: bool = False
 
         self._callbacks: list = []
         self._global_step: int = 0
@@ -450,11 +451,16 @@ class SCAO(Optimizer):
     # -----------------------------------------------------------------------
 
     @torch.no_grad()
-    def step(self, closure: Callable | None = None) -> Tensor | None:
+    def step(self, closure: Callable[[], Tensor] | None = None) -> Tensor | None:  # type: ignore[override]
         loss: Tensor | None = None
         if closure is not None:
             with torch.enable_grad():
                 loss = closure()
+
+        # Any curvature update queued by the previous step must complete before
+        # this step can read preconditioner factors. This keeps async execution
+        # deterministic without forcing a sync immediately after every update.
+        self.synchronize_precond()
 
         self._global_step += 1
 
@@ -490,6 +496,7 @@ class SCAO(Optimizer):
             self._lookahead_sync()
 
         if self._callbacks:
+            self.synchronize_precond()
             from .logging import collect_metrics
             metrics = collect_metrics(self)
             metrics["noise_std"] = self._noise_std
@@ -536,9 +543,12 @@ class SCAO(Optimizer):
             # R2: instantiate filter type once per parameter
             if self._sparsity > 0.0:
                 if pid not in self._sparse_filters:
-                    cls = _DynamicSparseFilter if self._dynamic_sparsity else _SparseGradFilter
-                    self._sparse_filters[pid] = cls(base_sparsity=self._sparsity) \
-                        if self._dynamic_sparsity else cls(self._sparsity)
+                    if self._dynamic_sparsity:
+                        self._sparse_filters[pid] = _DynamicSparseFilter(
+                            base_sparsity=self._sparsity
+                        )
+                    else:
+                        self._sparse_filters[pid] = _SparseGradFilter(self._sparsity)
                 grad = self._sparse_filters[pid](grad)
 
             if self._noise_std > 1e-9:
@@ -599,9 +609,6 @@ class SCAO(Optimizer):
             else:
                 should_update = (step % precond_freq == 0)
 
-            if should_update:
-                self._update_precond_async(precond, p.grad)
-
             g_precond = precond.precondition(p.grad)
             if tau is not None:
                 g_precond = self._curvature_clip(g_precond, precond, p.grad, tau, eps)
@@ -644,6 +651,12 @@ class SCAO(Optimizer):
             # Dividing by bc1 here would apply bias correction twice — use lr*trust only.
             p.add_(update.to(p.dtype), alpha=-(lr * trust))
 
+            # Update curvature after the parameter update has consumed the
+            # current factors. Async work can overlap the remaining optimizer
+            # bookkeeping and is fenced at the start of the next step.
+            if should_update:
+                self._update_precond_async(precond, p.grad)
+
     # -----------------------------------------------------------------------
     # Helpers
     # -----------------------------------------------------------------------
@@ -654,13 +667,14 @@ class SCAO(Optimizer):
         references to the original grad tensor which might be needed for
         other param groups or overlapping steps.
         """
-        # Detach ensures we don't hold the graph. 
+        # Detach ensures we don't hold the graph.
         # Clone ensures the data is isolated for the async stream.
         g_detached = grad.detach()
         if self._precond_stream is not None:
             g_update = g_detached.clone()
             with torch.cuda.stream(self._precond_stream):
                 precond.update_curvature(g_update)
+            self._precond_async_pending = True
         else:
             precond.update_curvature(g_detached)
 
@@ -680,12 +694,13 @@ class SCAO(Optimizer):
     def synchronize_precond(self) -> None:
         """Block until all pending async preconditioner updates complete.
         Call before checkpointing or evaluation when async_precond=True."""
-        if self._precond_stream is not None:
+        if self._precond_stream is not None and self._precond_async_pending:
             self._precond_stream.synchronize()
+            self._precond_async_pending = False
 
     def sync_preconditioner(
         self,
-        process_group: "torch.distributed.ProcessGroup | None" = None,
+        process_group: torch.distributed.ProcessGroup | None = None,
     ) -> None:
         """Broadcast optimizer state from rank 0 to all ranks.
         Not needed during normal DDP training; call only after loading
@@ -713,10 +728,10 @@ class SCAO(Optimizer):
     # Callbacks
     # -----------------------------------------------------------------------
 
-    def add_callback(self, callback) -> None:
+    def add_callback(self, callback: Callable[[dict[str, object]], None]) -> None:
         self._callbacks.append(callback)
 
-    def remove_callback(self, callback) -> None:
+    def remove_callback(self, callback: Callable[[dict[str, object]], None]) -> None:
         try:
             self._callbacks.remove(callback)
         except ValueError:
@@ -805,7 +820,21 @@ class SCAO(Optimizer):
 # Scale presets
 # ---------------------------------------------------------------------------
 
-def scao_sub1b(model, lr: float = 5e-4, **kw) -> SCAO:
+def _params_from_model_or_iterable(model_or_params: Any) -> Iterable:
+    return cast(Iterable, (
+        model_or_params.parameters()
+        if hasattr(model_or_params, "parameters")
+        else model_or_params
+    ))
+
+
+def _merge_preset_defaults(overrides: dict[str, Any], **defaults: Any) -> dict[str, Any]:
+    merged = dict(defaults)
+    merged.update(overrides)
+    return merged
+
+
+def scao_sub1b(model_or_params: Any, lr: float = 5e-4, **kw: Any) -> SCAO:
     """
     <1B params (125M–999M). RTX 3060/T4, CPU offload.
     Kronecker inversion is cheap at this scale — maximise update frequency.
@@ -814,189 +843,152 @@ def scao_sub1b(model, lr: float = 5e-4, **kw) -> SCAO:
     diagonal; verify SparsePreconditioner has this guard before use.
     """
     return SCAO(
-        model.parameters(), lr=lr,
-        warmup_steps=20,
-        min_precond_updates=3,
-        precond_freq=5,
-        k_min=4,
-        k_max=64,
-        max_precond_dim=1024,
-        epsilon_sparse=0.10,
-        sparsity=0.4,               # small layers need every gradient signal
-        dynamic_sparsity=True,
-        adaptive_warmup=True,
-        warmup_stability_threshold=0.08,
-        warmup_patience=3,
-        lazy_precond=False,
-        use_gsnr_clip=False,        # large relative batch → low stochastic noise
-        adaptive_rank=False,        # adjustment overhead not worth it at this scale
-        noise_std_init=0.005,
-        noise_anneal=0.995,
-        lars_coeff=5e-4,
-        lookahead_k=0,
-        beta3=0.98,
-        tau=0.8,
-        **kw,
+        _params_from_model_or_iterable(model_or_params), lr=lr,
+        **_merge_preset_defaults(
+            kw,
+            warmup_steps=20,
+            min_precond_updates=3,
+            precond_freq=5,
+            k_min=4,
+            k_max=64,
+            max_precond_dim=1024,
+            epsilon_sparse=0.10,
+            sparsity=0.4,
+            dynamic_sparsity=True,
+            adaptive_warmup=True,
+            warmup_stability_threshold=0.08,
+            warmup_patience=3,
+            lazy_precond=False,
+            use_gsnr_clip=False,
+            adaptive_rank=False,
+            noise_std_init=0.005,
+            noise_anneal=0.995,
+            lars_coeff=5e-4,
+            lookahead_k=0,
+            beta3=0.98,
+            tau=0.8,
+        ),
     )
 
 
-def scao_1b(model, lr: float = 3e-4, **kw) -> SCAO:
+def scao_1b(model_or_params: Any, lr: float = 3e-4, **kw: Any) -> SCAO:
     """
     1B–3B params (Phi-2, Gemma-2B, TinyLlama). RTX 3090/A10, T4×2.
     """
     return SCAO(
-        model.parameters(), lr=lr,
-        warmup_steps=35,
-        min_precond_updates=5,
-        precond_freq=8,
-        k_min=4,
-        k_max=96,
-        max_precond_dim=2048,
-        epsilon_sparse=0.07,
-        sparsity=0.50,
-        dynamic_sparsity=True,
-        adaptive_warmup=True,
-        warmup_stability_threshold=0.06,
-        warmup_patience=4,
-        lazy_precond=False,
-        use_gsnr_clip=False,
-        adaptive_rank=False,
-        noise_std_init=0.008,
-        noise_anneal=0.997,
-        lars_coeff=8e-4,
-        lookahead_k=3,
-        lookahead_alpha=0.4,
-        beta3=0.985,
-        tau=0.9,
-        **kw,
+        _params_from_model_or_iterable(model_or_params), lr=lr,
+        **_merge_preset_defaults(
+            kw,
+            warmup_steps=35,
+            min_precond_updates=5,
+            precond_freq=8,
+            k_min=4,
+            k_max=96,
+            max_precond_dim=2048,
+            epsilon_sparse=0.07,
+            sparsity=0.50,
+            dynamic_sparsity=True,
+            adaptive_warmup=True,
+            warmup_stability_threshold=0.06,
+            warmup_patience=4,
+            lazy_precond=False,
+            use_gsnr_clip=False,
+            adaptive_rank=False,
+            noise_std_init=0.008,
+            noise_anneal=0.997,
+            lars_coeff=8e-4,
+            lookahead_k=3,
+            lookahead_alpha=0.4,
+            beta3=0.985,
+            tau=0.9,
+        ),
     )
 
 
-def scao_3b(model, lr: float = 2e-4, **kw) -> SCAO:
+def scao_3b(model_or_params: Any, lr: float = 2e-4, **kw: Any) -> SCAO:
     """3B params. T4/A10 16–24 GB, QLoRA."""
     return SCAO(
-        model.parameters(), lr=lr,
-        warmup_steps=50,
-        blend_steps=30,
-        precond_freq=10,
-        dynamic_sparsity=True,
-        adaptive_warmup=True,
-        warmup_patience=3,
-        lazy_precond=False,
-        use_gsnr_clip=False,
-        adaptive_rank=False,
-        sparsity=0.6,
-        **kw,
+        _params_from_model_or_iterable(model_or_params), lr=lr,
+        **_merge_preset_defaults(
+            kw,
+            warmup_steps=50,
+            blend_steps=30,
+            precond_freq=10,
+            dynamic_sparsity=True,
+            adaptive_warmup=True,
+            warmup_patience=3,
+            lazy_precond=False,
+            use_gsnr_clip=False,
+            adaptive_rank=False,
+            sparsity=0.6,
+        ),
     )
 
 
-def scao_7b(model, lr: float = 1e-4, **kw) -> SCAO:
+def scao_7b(model_or_params: Any, lr: float = 1e-4, **kw: Any) -> SCAO:
     """7B params. A100 40 GB, QLoRA or full fine-tune."""
     return SCAO(
-        model.parameters(), lr=lr,
-        warmup_steps=80,
-        precond_freq=15,
-        dynamic_sparsity=True,
-        adaptive_warmup=True,
-        lazy_precond=False,
-        use_gsnr_clip=True,
-        gsnr_threshold=0.4,
-        adaptive_rank=True,
-        sparsity=0.65,
-        **kw,
+        _params_from_model_or_iterable(model_or_params), lr=lr,
+        **_merge_preset_defaults(
+            kw,
+            warmup_steps=80,
+            precond_freq=15,
+            dynamic_sparsity=True,
+            adaptive_warmup=True,
+            lazy_precond=False,
+            use_gsnr_clip=True,
+            gsnr_threshold=0.4,
+            adaptive_rank=True,
+            sparsity=0.65,
+        ),
     )
 
 
-def scao_40b(model, lr: float = 5e-5, **kw) -> SCAO:
+def scao_40b(model_or_params: Any, lr: float = 5e-5, **kw: Any) -> SCAO:
     """14B–70B params. 4–8×A100/H100."""
     return SCAO(
-        model.parameters(), lr=lr,
-        warmup_steps=100,
-        blend_steps=50,
-        precond_freq=20,
-        dynamic_sparsity=True,
-        adaptive_warmup=True,
-        lazy_precond=True,          # saves 60-80% of matrix inversions
-        lazy_delta_threshold=0.08,
-        lazy_max_skip=40,
-        use_gsnr_clip=True,
-        gsnr_threshold=0.5,
-        adaptive_rank=True,
-        use_int8_ema=True,          # int8 Kronecker factors: -75% HBM for precond state
-        sparsity=0.75,
-        **kw,
+        _params_from_model_or_iterable(model_or_params), lr=lr,
+        **_merge_preset_defaults(
+            kw,
+            warmup_steps=100,
+            blend_steps=50,
+            precond_freq=20,
+            dynamic_sparsity=True,
+            adaptive_warmup=True,
+            lazy_precond=True,
+            lazy_delta_threshold=0.08,
+            lazy_max_skip=40,
+            use_gsnr_clip=True,
+            gsnr_threshold=0.5,
+            adaptive_rank=True,
+            use_int8_ema=True,
+            sparsity=0.75,
+        ),
     )
 
 
-def scao_125b(model, lr: float = 2e-5, **kw) -> SCAO:
+def scao_125b(model_or_params: Any, lr: float = 2e-5, **kw: Any) -> SCAO:
     """70B+ params. FSDP / Megatron, 32–64×H100."""
     return SCAO(
-        model.parameters(), lr=lr,
-        warmup_steps=200,
-        precond_freq=50,
-        max_precond_dim=2048,
-        dynamic_sparsity=True,
-        adaptive_warmup=True,
-        lazy_precond=True,
-        lazy_delta_threshold=0.05,
-        lazy_max_skip=60,
-        use_gsnr_clip=True,
-        gsnr_threshold=0.6,
-        adaptive_rank=True,
-        use_int8_ema=True,
-        sparsity=0.80,
-        lookahead_k=10,
-        async_precond=True,
-        **kw,
+        _params_from_model_or_iterable(model_or_params), lr=lr,
+        **_merge_preset_defaults(
+            kw,
+            warmup_steps=200,
+            precond_freq=50,
+            max_precond_dim=2048,
+            dynamic_sparsity=True,
+            adaptive_warmup=True,
+            lazy_precond=True,
+            lazy_delta_threshold=0.05,
+            lazy_max_skip=60,
+            use_gsnr_clip=True,
+            gsnr_threshold=0.6,
+            adaptive_rank=True,
+            use_int8_ema=True,
+            sparsity=0.80,
+            lookahead_k=10,
+            async_precond=True,
+        ),
     )
 
 
-# ---------------------------------------------------------------------------
-# Scale Presets (v3)
-# ---------------------------------------------------------------------------
-
-def scao_sub1b(model_or_params, lr=1e-3, **kwargs):
-    """Preset for models < 1B params (Balanced)."""
-    params = model_or_params.parameters() if hasattr(model_or_params, "parameters") else model_or_params
-    return SCAO(params, lr=lr, k_max=64, use_int8_ema=False, **kwargs)
-
-def scao_1b(model_or_params, lr=1e-3, **kwargs):
-    """Preset for ~1B models (Memory-efficient)."""
-    params = model_or_params.parameters() if hasattr(model_or_params, "parameters") else model_or_params
-    return SCAO(params, lr=lr, k_max=48, use_int8_ema=True, async_precond=True, **kwargs)
-
-def scao_3b(model_or_params, lr=3e-4, **kwargs):
-    """Preset for ~3B models (Aggressive compression)."""
-    params = model_or_params.parameters() if hasattr(model_or_params, "parameters") else model_or_params
-    return SCAO(params, lr=lr, k_max=32, use_int8_ema=True, async_precond=True, warmup_steps=20, blend_steps=10, **kwargs)
-
-def scao_7b(model_or_params, lr=1e-4, **kwargs):
-    """Preset for ~7B models (Max stability)."""
-    params = model_or_params.parameters() if hasattr(model_or_params, "parameters") else model_or_params
-    return SCAO(params, lr=lr, k_max=24, use_int8_ema=True, async_precond=False, dynamic_sparsity=False, **kwargs)
-
-def scao_40b(model_or_params, lr=1e-4, **kwargs):
-    """Preset for ~40B models (Lazy precond & gSNR)."""
-    params = model_or_params.parameters() if hasattr(model_or_params, "parameters") else model_or_params
-    return SCAO(
-        params, lr=lr, k_max=16, 
-        use_int8_ema=True, 
-        async_precond=True, 
-        lazy_precond=True, 
-        use_gsnr_clip=True, 
-        **kwargs
-    )
-
-def scao_125b(model_or_params, lr=5e-5, **kwargs):
-    """Preset for ~125B models (Maximum throughput & offload-friendly)."""
-    params = model_or_params.parameters() if hasattr(model_or_params, "parameters") else model_or_params
-    return SCAO(
-        params, lr=lr, k_max=8, 
-        use_int8_ema=True, 
-        async_precond=True, 
-        lazy_precond=True, 
-        lazy_max_skip=100,
-        use_gsnr_clip=True, 
-        adaptive_rank=True,
-        **kwargs
-    )

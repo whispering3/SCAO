@@ -29,7 +29,6 @@ import math
 import os
 import sys
 import time
-from collections import defaultdict
 from typing import Any
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
@@ -39,7 +38,6 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 
 from scao import SCAO
-
 
 # ===========================================================================
 # Baseline optimizers (no external deps)
@@ -63,7 +61,7 @@ class DiagonalShampoo(torch.optim.Optimizer):
         eps: float = 1e-8,
         weight_decay: float = 0.01,
     ) -> None:
-        defaults = dict(lr=lr, beta=beta, eps=eps, weight_decay=weight_decay)
+        defaults = {"lr": lr, "beta": beta, "eps": eps, "weight_decay": weight_decay}
         super().__init__(params, defaults)
 
     @torch.no_grad()
@@ -122,8 +120,12 @@ class Muon(torch.optim.Optimizer):
         weight_decay: float = 0.01,
         ns_steps: int = 5,
     ) -> None:
-        defaults = dict(lr=lr, momentum=momentum, weight_decay=weight_decay,
-                        ns_steps=ns_steps)
+        defaults = {
+            "lr": lr,
+            "momentum": momentum,
+            "weight_decay": weight_decay,
+            "ns_steps": ns_steps,
+        }
         super().__init__(params, defaults)
 
     @staticmethod
@@ -410,7 +412,7 @@ def _color(name: str, text: str) -> str:
 
 def ascii_loss_chart(results: list[dict], width: int = 72, height: int = 20) -> None:
     """Print a compact ASCII loss curve for all optimizers."""
-    all_losses = [l for r in results for l in r["losses"]]
+    all_losses = [loss for r in results for loss in r["losses"]]
     y_min = min(all_losses) * 0.98
     y_max = max(all_losses[: len(results[0]["losses"]) // 5]) * 1.02  # zoom on early
 
@@ -486,7 +488,7 @@ def print_summary(results: list[dict], threshold: float) -> None:
     if scao_r and adamw_r:
         auc_ratio     = adamw_r["auc"]      / max(scao_r["auc"],     1e-9)
         speed_ratio   = scao_r["steps_per_sec"] / max(adamw_r["steps_per_sec"], 1e-9)
-        print(f"\n  SCAO vs AdamW:")
+        print("\n  SCAO vs AdamW:")
         print(f"    AUC ratio      : {auc_ratio:.3f}x  (>1 means SCAO converges faster)")
         print(f"    Throughput     : {speed_ratio:.3f}x  (1 = same speed)")
         if scao_r.get("peak_memory_mb") and adamw_r.get("peak_memory_mb"):

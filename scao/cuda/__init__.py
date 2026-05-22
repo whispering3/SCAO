@@ -19,7 +19,7 @@ fused_kronecker_precond(U_l, s_l_inv4, U_r, s_r_inv4, G) -> Tensor
         P     = U_l^T @ G @ U_r          (k×k)
         delta = (s_l_inv4[:,None] * s_r_inv4[None,:] - 1) * P
         out   = G + U_l @ delta @ U_r^T
-    Uses the fused CUDA kernel when k <= 128 and all tensors are on CUDA.
+    Uses the fused CUDA kernel when k <= 32 and all tensors are on CUDA.
     Falls back to pure PyTorch otherwise.
 
 low_rank_precond_mm(U, s, G, left=True) -> Tensor
@@ -35,7 +35,7 @@ from __future__ import annotations
 
 import os
 import warnings
-from typing import Tuple
+from typing import Protocol, cast
 
 import torch
 from torch import Tensor
@@ -44,11 +44,32 @@ from torch import Tensor
 # Extension load
 # ---------------------------------------------------------------------------
 
-_ext = None
+class _CudaExtension(Protocol):
+    def fused_kronecker_precond(
+        self,
+        U_l: Tensor,
+        s_l_inv4: Tensor,
+        U_r: Tensor,
+        s_r_inv4: Tensor,
+        G: Tensor,
+    ) -> Tensor: ...
+
+    def low_rank_precond_mm(self, U: Tensor, s: Tensor, G: Tensor, left: bool) -> Tensor: ...
+
+    def int8_ema_update(
+        self,
+        ema_q: Tensor,
+        ema_scale: float,
+        new_val: Tensor,
+        rho: float,
+    ) -> tuple[Tensor, float]: ...
+
+
+_ext: _CudaExtension | None = None
 _ext_load_attempted = False
 
 
-def _load_ext() -> object | None:
+def _load_ext() -> _CudaExtension | None:
     global _ext, _ext_load_attempted
     if _ext_load_attempted:
         return _ext
@@ -56,8 +77,8 @@ def _load_ext() -> object | None:
     try:
         # Import the compiled C++ extension.
         # It is usually named _scao_cuda and placed in this directory.
-        from . import _scao_cuda  # type: ignore[import]
-        _ext = _scao_cuda
+        from . import _scao_cuda  # type: ignore[attr-defined]
+        _ext = cast(_CudaExtension, _scao_cuda)
     except ImportError:
         msg = (
             "SCAO: compiled CUDA extension 'scao.cuda._scao_cuda' not found. "
@@ -124,7 +145,7 @@ def _int8_ema_update_pytorch(
     ema_scale: float,
     new_val: Tensor,
     rho: float,
-) -> Tuple[Tensor, float]:
+) -> tuple[Tensor, float]:
     """
     Pure-PyTorch int8 EMA update.
 
@@ -157,7 +178,7 @@ def fused_kronecker_precond(
     Apply fused Kronecker identity+correction preconditioner to gradient G.
 
     Routing:
-      - CUDA extension available AND k <= 128 AND all tensors on CUDA
+      - CUDA extension available AND k <= 32 AND all tensors on CUDA
         → ``_scao_cuda.fused_kronecker_precond`` (kernel 3)
       - Otherwise
         → pure-PyTorch fallback
@@ -177,9 +198,10 @@ def fused_kronecker_precond(
     use_cuda_kernel = (
         ext is not None
         and G.is_cuda
-        and k <= 128
+        and k <= 32
     )
     if use_cuda_kernel:
+        assert ext is not None
         try:
             return ext.fused_kronecker_precond(U_l, s_l_inv4, U_r, s_r_inv4, G)
         except (AttributeError, RuntimeError):
@@ -221,6 +243,7 @@ def low_rank_precond_mm(
         and U.is_cuda
     )
     if use_cuda_kernel:
+        assert ext is not None
         try:
             return ext.low_rank_precond_mm(U, s, G, left)
         except (AttributeError, RuntimeError):
@@ -233,7 +256,7 @@ def int8_ema_update(
     ema_scale: float,
     new_val: Tensor,
     rho: float,
-) -> Tuple[Tensor, float]:
+) -> tuple[Tensor, float]:
     """
     Fused int8 EMA update: dequantize → rho*old + new_val → requantize.
 
@@ -259,6 +282,7 @@ def int8_ema_update(
         and new_val.is_cuda
     )
     if use_cuda_kernel:
+        assert ext is not None
         try:
             return ext.int8_ema_update(ema_q, ema_scale, new_val, rho)
         except (AttributeError, RuntimeError):

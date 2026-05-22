@@ -19,7 +19,6 @@ Requirements:
 from __future__ import annotations
 
 import argparse
-import csv
 import math
 import os
 import sys
@@ -29,17 +28,14 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 from scao import SCAO
 from scao.benchmarks.gpt_comparison import (
-    TinyGPT,
     DiagonalShampoo,
+    TinyGPT,
     ascii_loss_chart,
-    print_summary,
     save_csv,
 )
-
 
 # ===========================================================================
 # Data pipeline
@@ -354,7 +350,7 @@ def main():
     if scao_r and adamw_r:
         val_ratio = adamw_r["final_val"] / max(scao_r["final_val"], 1e-9)
         ppl_delta = adamw_r["final_ppl"] - scao_r["final_ppl"]
-        print(f"\n  SCAO vs AdamW:")
+        print("\n  SCAO vs AdamW:")
         print(f"    Val loss ratio : {val_ratio:.4f}x")
         print(f"    PPL improvement: {ppl_delta:+.2f} (positive = SCAO better)")
     print(f"{'=' * w}\n")
