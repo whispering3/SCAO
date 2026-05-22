@@ -54,8 +54,7 @@
 11. [Hyperparameter Reference](#11-hyperparameter-reference)
 12. [Reproducing Results](#12-reproducing-results)
 13. [Repository Structure](#13-repository-structure)
-14. [Production GPU Readiness](#14-production-gpu-readiness)
-15. [Citation](#15-citation)
+14. [Citation](#14-citation)
 
 ---
 
@@ -157,7 +156,7 @@ python scao_benchmarks_t4/benchmark_t4.py --mode qlora --model_id "Qwen/Qwen2.5-
 
 Production-quality CUDA kernels for the Kronecker projection operations:
 - **Tiled shared-memory GEMM** — 16×16 tile blocking, eliminates redundant global-memory reads
-- **Fused Kronecker preconditioner kernel** (k ≤ 32) — computes the full identity+correction in one launch, no intermediate `(m,n)` tensor
+- **Fused Kronecker preconditioner kernel** (k ≤ 128) — computes the full identity+correction in one launch, no intermediate `(m,n)` tensor
 - **Int8 EMA update kernel** — two-pass design: compute new EMA value + requantize to int8
 - **Bug fix**: the naïve implementation had an `O(k·m²·n)` complexity regression (each output thread recomputed the full `U^T @ G` projection); the fused kernel achieves the correct `O(k·m·n)`
 
@@ -702,7 +701,7 @@ scao/                               # Core library
 └── cuda/
     ├── low_rank_ops.cu             # Fused CUDA kernels: tiled GEMM, Kronecker precond, int8 EMA
     ├── __init__.py                 # fused_kronecker_precond(), int8_ema_update(), truncated_eigh()
-    └── setup.py                    # nvcc build (sm_75/80/86/89/90)
+    └── setup.py                    # nvcc build (sm_70/75/80/86/89/90)
 
 scao_benchmarks_t4/                 # Unified T4/Colab benchmark suite
 ├── benchmark_t4.py                 # Main benchmark (Synthetic & QLoRA)
@@ -713,9 +712,6 @@ benchmark/                           # Self-contained runnable examples
 ├── train_1m.py                     # Full fine-tuning throughput benchmark on TinyStories-1M
 └── inference.py                    # Load LoRA checkpoint and generate text
 
-examples/
-└── finetune_distilgpt2_colab.py    # Lightweight HF Trainer fine-tuning recipe
-
 configs/                            # YAML hyperparameter configs
 ├── base.yaml                       # Shared defaults
 ├── gpt_small.yaml                  # GPT-small (117M) config
@@ -725,8 +721,6 @@ scripts/
 ├── run_experiment.py               # Python experiment runner with argparse
 ├── run_experiment.sh               # Full reproduction shell script
 ├── bench_125m_350m.py              # 125M / 350M benchmark (AdamW vs SCAO vs SCAO-int8)
-├── gpu_compat_check.py             # GPU/device compatibility check
-├── colab_real_user_test.py         # Real-user Colab fine-tuning validation
 └── scao_colab_benchmark.ipynb      # Colab GPU benchmark (125M / 350M)
 
 paper/
@@ -749,89 +743,7 @@ results_scao_vs_adamw.csv           # Per-step training loss (Phase 1 analysis)
 
 ---
 
-## 14. Production GPU Readiness
-
-SCAO is designed to be usable first, optimized second:
-
-- The PyPI package works without compiling CUDA kernels.
-- If `scao.cuda._scao_cuda` is unavailable, SCAO automatically uses the pure-PyTorch fallback.
-- The CUDA extension is an optimized path for supported NVIDIA architectures and currently routes the fused Kronecker kernel only when `k <= 32`.
-
-### Compatibility Matrix
-
-| Hardware | Compute capability | Status | Notes |
-|---|---:|---|---|
-| CPU | n/a | Supported | PyTorch fallback |
-| NVIDIA T4 | sm_75 | Validated | Google Colab T4 smoke + real HF fine-tuning |
-| NVIDIA A100 | sm_80 | Production target | Needs runner validation before claiming benchmark numbers |
-| NVIDIA A10/A10G | sm_86 | Production target | Common cloud fine-tuning GPU |
-| RTX 3090 | sm_86 | Production target | Workstation fine-tuning |
-| RTX 4090 | sm_89 | Production target | Workstation fine-tuning |
-| NVIDIA L4/L40S | sm_89 | Production target | Cloud fine-tuning/inference |
-| NVIDIA H100 | sm_90 | Production target | Needs runner validation before claiming benchmark numbers |
-| AMD ROCm | n/a | Not validated | Fallback may need ROCm-specific testing |
-| Apple MPS | n/a | Not validated | Not a CUDA target |
-
-### Check a New Machine
-
-Before a benchmark or fine-tuning run, execute:
-
-```bash
-python scripts/gpu_compat_check.py
-```
-
-To attempt building the optional CUDA extension:
-
-```bash
-python scripts/gpu_compat_check.py --compile-cuda-ext
-```
-
-For release/CI jobs where the CUDA extension is required:
-
-```bash
-python scripts/gpu_compat_check.py --compile-cuda-ext --strict-cuda-ext
-```
-
-Recommended conservative config for T4/A10-class GPUs:
-
-```python
-scao_kwargs = {
-    "precond_freq": 20,
-    "max_precond_dim": 1024,
-    "k_min": 4,
-    "k_max": 32,
-    "async_precond": True,
-    "noise_std_init": 0.0,
-    "sparsity": 0.0,
-    "lars_coeff": 0.0,
-    "lookahead_k": 0,
-}
-```
-
-### Lightweight Fine-Tuning Example
-
-For a real Colab workflow with Hugging Face Trainer:
-
-```bash
-pip install -U scao "transformers>=4.30" "datasets>=2.0" accelerate
-python examples/finetune_distilgpt2_colab.py
-```
-
-This example fine-tunes `distilgpt2` on WikiText-2 with fp16 and conservative SCAO defaults. It is intended as a user-facing recipe, not a synthetic benchmark.
-
-### Production Checklist
-
-Before claiming production support for a new GPU class:
-
-1. Run `python scripts/gpu_compat_check.py`.
-2. Run `python scripts/colab_t4_smoke_test.py --quick` or the equivalent smoke test on that GPU.
-3. Run `python scripts/colab_real_user_test.py --quick`.
-4. Record PyTorch, CUDA, GPU name, compute capability, peak VRAM, train loss, eval loss, and whether the CUDA extension loaded.
-5. Compare against AdamW for the target workload before making performance claims.
-
----
-
-## 15. Citation
+## 14. Citation
 
 If you use SCAO in your research, please cite:
 
