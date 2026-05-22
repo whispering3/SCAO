@@ -101,6 +101,7 @@ def _build_model_and_tokenizer(model_name: str) -> tuple[Any, Any]:
 def _make_training_args(args: argparse.Namespace, output_dir: str) -> Any:
     from transformers import TrainingArguments
 
+    signature = inspect.signature(TrainingArguments)
     kwargs: dict[str, Any] = {
         "output_dir": output_dir,
         "overwrite_output_dir": True,
@@ -121,12 +122,16 @@ def _make_training_args(args: argparse.Namespace, output_dir: str) -> Any:
         "seed": args.seed,
     }
 
-    signature = inspect.signature(TrainingArguments)
     if "eval_strategy" in signature.parameters:
         kwargs["eval_strategy"] = "steps"
-    else:
+    elif "evaluation_strategy" in signature.parameters:
         kwargs["evaluation_strategy"] = "steps"
 
+    kwargs = {
+        name: value
+        for name, value in kwargs.items()
+        if name in signature.parameters
+    }
     return TrainingArguments(**kwargs)
 
 
