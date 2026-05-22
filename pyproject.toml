@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "scao"
-version = "0.2.0"
+version = "0.2.2"
 description = "Sparse Curvature-Aware Adaptive Optimizer — second-order training at near-AdamW cost"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -40,6 +40,10 @@ Documentation = "https://github.com/whispering3/scao#readme"
 Changelog = "https://github.com/whispering3/scao/blob/main/CHANGELOG.md"
 Paper = "https://doi.org/10.5281/zenodo.19839495"
 
+[project.scripts]
+scao-scale-planner = "scao.tools.scale_planner:main"
+scao-preconditioner-bench = "scao.tools.preconditioner_microbench:main"
+
 [project.optional-dependencies]
 dev = [
   "pytest>=7.0",
@@ -72,7 +76,7 @@ all = [
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["scao*"]
-exclude = ["scao/tests*", "scao/benchmarks*"]
+exclude = ["scao.tests*", "scao.benchmarks*"]
 
 [tool.setuptools.package-data]
 scao = ["py.typed"]

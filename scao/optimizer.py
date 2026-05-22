@@ -253,6 +253,11 @@ class SCAO(Optimizer):
         adaptive_rank (bool):
             Adjusts preconditioner k based on per-layer grad norm ratio (R5).
             Default: False.
+        preconditioner_enabled (bool):
+            Whether to allocate and apply the Kronecker/diagonal preconditioner
+            for this parameter group. Set to False for very large embeddings or
+            output heads in 100B+ fine-tuning when the curvature overhead is not
+            worth the memory/latency tradeoff.
     """
 
     def __init__(
@@ -293,6 +298,7 @@ class SCAO(Optimizer):
         use_gsnr_clip: bool = False,
         gsnr_threshold: float = 0.5,
         adaptive_rank: bool = False,
+        preconditioner_enabled: bool = True,
     ) -> None:
         if lr < 0:
             raise ValueError(f"Invalid lr: {lr}")
@@ -311,6 +317,7 @@ class SCAO(Optimizer):
             "min_precond_updates": min_precond_updates,
             "max_precond_dim": max_precond_dim, "use_newton_schulz": use_newton_schulz,
             "use_int8_ema": use_int8_ema, "beta3": beta3, "lars_coeff": lars_coeff,
+            "preconditioner_enabled": preconditioner_enabled,
         }
         super().__init__(params, defaults)
 
@@ -422,16 +429,17 @@ class SCAO(Optimizer):
                                                  memory_format=torch.preserve_format)
         state["prev_grad"] = torch.zeros_like(p, dtype=torch.float32,
                                               memory_format=torch.preserve_format)
-        state["preconditioner"] = SparsePreconditioner(
-            param=p,
-            epsilon_sparse=group["epsilon_sparse"],
-            k_min=group["k_min"],
-            k_max=group["k_max"],
-            rho=group["rho"],
-            max_precond_dim=group["max_precond_dim"],
-            use_newton_schulz=group["use_newton_schulz"],
-            use_int8_ema=group["use_int8_ema"],
-        )
+        if group.get("preconditioner_enabled", True):
+            state["preconditioner"] = SparsePreconditioner(
+                param=p,
+                epsilon_sparse=group["epsilon_sparse"],
+                k_min=group["k_min"],
+                k_max=group["k_max"],
+                rho=group["rho"],
+                max_precond_dim=group["max_precond_dim"],
+                use_newton_schulz=group["use_newton_schulz"],
+                use_int8_ema=group["use_int8_ema"],
+            )
 
     # -----------------------------------------------------------------------
     # Grad norm (feeds R1, R2, R5)
@@ -562,9 +570,10 @@ class SCAO(Optimizer):
             exp_avg_sq   = state["exp_avg_sq"]
             exp_avg_diff = state["exp_avg_diff"]
             prev_grad    = state["prev_grad"]
-            precond: SparsePreconditioner = state["preconditioner"]
+            precond: SparsePreconditioner | None = state.get("preconditioner")
 
-            self._maybe_adjust_rank(precond, grad_norm, group)
+            if precond is not None:
+                self._maybe_adjust_rank(precond, grad_norm, group)
 
             # R1: adaptive warmup — use the per-step flag computed once in step().
             # Non-adaptive path falls back to the per-param step counter.
@@ -572,7 +581,7 @@ class SCAO(Optimizer):
                 self._in_warmup_global
                 if self._adaptive_warmup
                 else (step <= warmup_steps)
-            ) or (precond.precond_step < min_pu)
+            ) or (precond is not None and precond.precond_step < min_pu)
 
             if in_warmup:
                 exp_avg.mul_(beta1).add_(grad, alpha=1.0 - beta1)
@@ -581,7 +590,7 @@ class SCAO(Optimizer):
                 bc2 = 1.0 - beta2 ** step
                 denom = (exp_avg_sq.sqrt() / math.sqrt(bc2)).add_(eps)
                 # Accumulate curvature during warmup so Phase 2 starts warm
-                if step % precond_freq == 0:
+                if precond is not None and step % precond_freq == 0:
                     self._update_precond_async(precond, p.grad)
                 p.add_((exp_avg / denom).to(p.dtype), alpha=-(lr / bc1))
                 prev_grad.copy_(grad)
@@ -609,8 +618,8 @@ class SCAO(Optimizer):
             else:
                 should_update = (step % precond_freq == 0)
 
-            g_precond = precond.precondition(p.grad)
-            if tau is not None:
+            g_precond = precond.precondition(p.grad) if precond is not None else grad
+            if tau is not None and precond is not None:
                 g_precond = self._curvature_clip(g_precond, precond, p.grad, tau, eps)
 
             # Linear blend from raw gradient to preconditioned over blend_steps,
@@ -654,7 +663,7 @@ class SCAO(Optimizer):
             # Update curvature after the parameter update has consumed the
             # current factors. Async work can overlap the remaining optimizer
             # bookkeeping and is fenced at the start of the next step.
-            if should_update:
+            if should_update and precond is not None:
                 self._update_precond_async(precond, p.grad)
 
     # -----------------------------------------------------------------------
@@ -953,6 +962,9 @@ def scao_40b(model_or_params: Any, lr: float = 5e-5, **kw: Any) -> SCAO:
             warmup_steps=100,
             blend_steps=50,
             precond_freq=20,
+            k_min=4,
+            k_max=64,
+            max_precond_dim=2048,
             dynamic_sparsity=True,
             adaptive_warmup=True,
             lazy_precond=True,
@@ -963,6 +975,7 @@ def scao_40b(model_or_params: Any, lr: float = 5e-5, **kw: Any) -> SCAO:
             adaptive_rank=True,
             use_int8_ema=True,
             sparsity=0.75,
+            lookahead_k=0,
         ),
     )
 
@@ -975,7 +988,9 @@ def scao_125b(model_or_params: Any, lr: float = 2e-5, **kw: Any) -> SCAO:
             kw,
             warmup_steps=200,
             precond_freq=50,
-            max_precond_dim=2048,
+            k_min=4,
+            k_max=32,
+            max_precond_dim=1024,
             dynamic_sparsity=True,
             adaptive_warmup=True,
             lazy_precond=True,
@@ -986,7 +1001,7 @@ def scao_125b(model_or_params: Any, lr: float = 2e-5, **kw: Any) -> SCAO:
             adaptive_rank=True,
             use_int8_ema=True,
             sparsity=0.80,
-            lookahead_k=10,
+            lookahead_k=0,
             async_precond=True,
         ),
     )

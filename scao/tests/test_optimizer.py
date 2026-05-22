@@ -745,3 +745,104 @@ class TestDistributed:
         opt.step()
         sync_preconditioners(opt)  # dist not initialized → silent no-op
 
+
+# ---------------------------------------------------------------------------
+# Large-scale presets
+# ---------------------------------------------------------------------------
+
+class TestLargeScalePresets:
+    """Large presets should avoid accidental full-parameter extra state."""
+
+    def test_40b_preset_is_memory_conservative(self):
+        from scao import scao_40b
+
+        model = nn.Linear(16, 16)
+        opt = scao_40b(model, lr=1e-4)
+
+        assert opt._lookahead_k == 0
+        assert opt.param_groups[0]["k_max"] == 64
+        assert opt.param_groups[0]["max_precond_dim"] == 2048
+        assert opt.param_groups[0]["use_int8_ema"] is True
+
+    def test_125b_preset_is_memory_conservative(self):
+        from scao import scao_125b
+
+        model = nn.Linear(16, 16)
+        opt = scao_125b(model, lr=1e-4)
+
+        assert opt._lookahead_k == 0
+        assert opt.param_groups[0]["k_max"] == 32
+        assert opt.param_groups[0]["max_precond_dim"] == 1024
+        assert opt.param_groups[0]["use_int8_ema"] is True
+
+    def test_param_group_can_disable_preconditioner(self):
+        p_precond = nn.Parameter(torch.randn(8, 8))
+        p_plain = nn.Parameter(torch.randn(8, 8))
+        opt = SCAO(
+            [
+                {"params": [p_precond], "preconditioner_enabled": True},
+                {"params": [p_plain], "preconditioner_enabled": False},
+            ],
+            lr=1e-3,
+            warmup_steps=0,
+            min_precond_updates=0,
+            sparsity=0.0,
+            noise_std_init=0.0,
+            lookahead_k=0,
+        )
+
+        loss = p_precond.pow(2).sum() + p_plain.pow(2).sum()
+        loss.backward()
+        opt.step()
+
+        assert "preconditioner" in opt.state[p_precond]
+        assert "preconditioner" not in opt.state[p_plain]
+
+    def test_state_dict_roundtrip_with_disabled_preconditioner_group(self):
+        p_precond = nn.Parameter(torch.randn(8, 8))
+        p_plain = nn.Parameter(torch.randn(8, 8))
+        opt = SCAO(
+            [
+                {"params": [p_precond], "preconditioner_enabled": True},
+                {"params": [p_plain], "preconditioner_enabled": False},
+            ],
+            lr=1e-3,
+            warmup_steps=0,
+            min_precond_updates=0,
+            sparsity=0.0,
+            noise_std_init=0.0,
+            lookahead_k=0,
+        )
+
+        for _ in range(3):
+            loss = p_precond.pow(2).sum() + p_plain.pow(2).sum()
+            loss.backward()
+            opt.step()
+            opt.zero_grad()
+
+        state = copy.deepcopy(opt.state_dict())
+
+        q_precond = nn.Parameter(torch.randn(8, 8))
+        q_plain = nn.Parameter(torch.randn(8, 8))
+        opt2 = SCAO(
+            [
+                {"params": [q_precond], "preconditioner_enabled": True},
+                {"params": [q_plain], "preconditioner_enabled": False},
+            ],
+            lr=1e-3,
+            warmup_steps=0,
+            min_precond_updates=0,
+            sparsity=0.0,
+            noise_std_init=0.0,
+            lookahead_k=0,
+        )
+
+        # Initialize optimizer state before loading, matching real resume flows.
+        (q_precond.pow(2).sum() + q_plain.pow(2).sum()).backward()
+        opt2.step()
+        opt2.zero_grad()
+        opt2.load_state_dict(state)
+
+        assert "preconditioner" in opt2.state[q_precond]
+        assert "preconditioner" not in opt2.state[q_plain]
+
