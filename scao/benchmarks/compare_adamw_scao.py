@@ -16,8 +16,9 @@ from __future__ import annotations
 
 import argparse
 import math
+import os
+import sys
 import time
-import sys, os
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
@@ -26,7 +27,6 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 
 from scao import SCAO
-
 
 # ---------------------------------------------------------------------------
 # Tiny GPT-like model
@@ -229,7 +229,7 @@ def main():
         results.append(r)
 
     print(f"\n{'='*60}")
-    print(f"  SUMMARY")
+    print("  SUMMARY")
     print(f"{'='*60}")
     for r in results:
         print(f"\n  {r['optimizer'].upper()}")
@@ -244,7 +244,7 @@ def main():
         a, s = results[0], results[1]
         speedup = a["avg_loss_last_20"] / max(s["avg_loss_last_20"], 1e-9)
         print(f"\n  SCAO loss ratio vs AdamW: {speedup:.3f}x")
-        print(f"  (>1 means SCAO reached lower loss in same steps)")
+        print("  (>1 means SCAO reached lower loss in same steps)")
     print()
 
 

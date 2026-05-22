@@ -14,19 +14,20 @@ Tests:
 
 from __future__ import annotations
 
-import math
 import copy
+import math
+import os
+
+# Add project root to path when running directly
+import sys
 
 import pytest
 import torch
 import torch.nn as nn
 
-# Add project root to path when running directly
-import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
-from scao import SCAO
-
+from scao import SCAO, scao_1b, scao_7b, scao_40b, scao_125b
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -114,6 +115,29 @@ class TestSCAOBasic:
         loss_val = opt.step(closure)
         assert loss_val is not None
 
+    def test_scale_presets_use_documented_hyperparams(self):
+        model = nn.Linear(8, 4)
+        opt_1b = scao_1b(model, async_precond=False)
+        assert opt_1b.param_groups[0]["lr"] == pytest.approx(3e-4)
+        assert opt_1b.param_groups[0]["precond_freq"] == 8
+        assert opt_1b._dynamic_sparsity is True
+
+        opt_7b = scao_7b(model, async_precond=False)
+        assert opt_7b.param_groups[0]["precond_freq"] == 15
+        assert opt_7b._use_gsnr_clip is True
+        assert opt_7b._adaptive_rank is True
+
+        opt_40b = scao_40b(model, async_precond=False)
+        assert opt_40b.param_groups[0]["lr"] == pytest.approx(5e-5)
+        assert opt_40b._lazy_precond is True
+        assert opt_40b._gsnr_threshold == pytest.approx(0.5)
+
+    def test_scale_presets_accept_parameter_iterables(self):
+        model = nn.Linear(8, 4)
+        opt = scao_125b(model.parameters(), async_precond=False)
+        assert isinstance(opt, SCAO)
+        assert opt.param_groups[0]["precond_freq"] == 50
+
 
 class TestSCAOConvergence:
     """Verify that SCAO converges on a simple ill-conditioned quadratic."""
@@ -130,8 +154,8 @@ class TestSCAOConvergence:
 
         for _ in range(500):
             opt.zero_grad()
-            l = loss_fn()
-            l.backward()
+            loss = loss_fn()
+            loss.backward()
             opt.step()
 
         err = (x - x_star).norm().item()
@@ -160,8 +184,8 @@ class TestSCAOConvergence:
 
         for _ in range(600):
             opt.zero_grad()
-            l = loss_fn()
-            l.backward()
+            loss = loss_fn()
+            loss.backward()
             opt.step()
 
         err = (x - x_star).norm().item()
@@ -180,10 +204,10 @@ class TestSCAOConvergence:
             opt = optimizer_cls([x], **kwargs)
             for step in range(2000):
                 opt.zero_grad()
-                l = loss_fn()
-                l.backward()
+                loss = loss_fn()
+                loss.backward()
                 opt.step()
-                if l.item() < target_loss:
+                if loss.item() < target_loss:
                     return step
             return 2000
 
@@ -237,7 +261,7 @@ class TestSCAOWarmup:
                 opt.step()
                 deltas.append((model.weight.data - w_before).sign().flatten())
 
-        for s, a in zip(scao_deltas, adam_deltas):
+        for s, a in zip(scao_deltas, adam_deltas, strict=True):
             agreement = (s == a).float().mean().item()
             assert agreement > 0.7, f"Warmup direction disagrees with Adam: {agreement:.2%}"
 
@@ -370,7 +394,7 @@ class TestCheckpointing:
             m_(x_new).sum().backward()
             o_.step()
 
-        for p1, p2 in zip(model.parameters(), model2.parameters()):
+        for p1, p2 in zip(model.parameters(), model2.parameters(), strict=True):
             assert torch.allclose(p1, p2, atol=1e-6), "Checkpoint round-trip mismatch"
 
 
@@ -699,8 +723,9 @@ class TestDistributed:
 
     def test_wrap_scao_for_fsdp_returns_optimizer(self):
         """wrap_scao_for_fsdp must return a callable optimizer."""
-        from scao.distributed import wrap_scao_for_fsdp
         import warnings
+
+        from scao.distributed import wrap_scao_for_fsdp
         model = nn.Linear(16, 8)
         opt = SCAO(model.parameters(), lr=1e-3)
         with warnings.catch_warnings():

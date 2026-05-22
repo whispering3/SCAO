@@ -4,8 +4,9 @@ Run:  python setup.py build_ext --inplace
 """
 
 from setuptools import setup
+
 try:
-    from torch.utils.cpp_extension import CUDAExtension, BuildExtension
+    from torch.utils.cpp_extension import BuildExtension, CUDAExtension
     ext_modules = [
         CUDAExtension(
             name="scao.cuda._scao_cuda",

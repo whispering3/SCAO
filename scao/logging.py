@@ -48,7 +48,8 @@ New in v2:
 from __future__ import annotations
 
 import math
-from typing import Callable
+from collections.abc import Callable
+from typing import Any, cast
 
 MetricsDict = dict[str, object]
 Callback = Callable[[MetricsDict], None]
@@ -96,7 +97,7 @@ class TensorBoardLogger:
         tag_prefix: prefix for all scalar tags
     """
 
-    def __init__(self, writer, log_every: int = 50, tag_prefix: str = "") -> None:
+    def __init__(self, writer: Any, log_every: int = 50, tag_prefix: str = "") -> None:
         self.writer = writer
         self.log_every = log_every
         self.tag_prefix = tag_prefix
@@ -139,7 +140,7 @@ class WandbLogger:
         try:
             import wandb  # type: ignore[import]
             wandb.log({k: v for k, v in metrics.items() if k != "step"},
-                      step=step)
+                      step=cast(int, step))
         except ImportError:
             pass
 
@@ -148,7 +149,7 @@ class WandbLogger:
 # Metrics collection (called internally by SCAO.step())
 # ---------------------------------------------------------------------------
 
-def collect_metrics(optimizer) -> MetricsDict:
+def collect_metrics(optimizer: Any) -> MetricsDict:
     """
     Collect current optimizer metrics from a SCAO instance.
     Called automatically by SCAO.step() if any callbacks are registered.
@@ -178,7 +179,7 @@ def collect_metrics(optimizer) -> MetricsDict:
         if "preconditioner" in state:
             prec = state["preconditioner"]
             ranks.append(prec.k)
-            
+
             # Safely collect L_ema norm if available (for curvature health diagnostics)
             if getattr(prec, "use_block_diagonal", False):
                 # For block-diagonal, average the norm across sub-blocks

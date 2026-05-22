@@ -26,7 +26,8 @@ In your DeepSpeed config, set:
 from __future__ import annotations
 
 import warnings
-from typing import TYPE_CHECKING
+from collections.abc import Iterator
+from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.distributed as dist
@@ -35,31 +36,76 @@ if TYPE_CHECKING:
     from .optimizer import SCAO
 
 
-def _collect_kronecker_tensors(
-    prec,
-    tensors_to_sync: list[torch.Tensor],
-    int8_ema_precs: list,
+def _iter_preconditioners(optimizer: SCAO) -> Iterator[Any]:
+    for state in optimizer.state.values():
+        prec = state.get("preconditioner")
+        if prec is not None:
+            yield prec
+
+
+def _iter_leaf_preconditioners(prec: Any) -> Iterator[Any]:
+    if getattr(prec, "use_block_diagonal", False):
+        for blk in prec._blocks:
+            yield from _iter_leaf_preconditioners(blk)
+    else:
+        yield prec
+
+
+def _preconditioner_step_sum(optimizer: SCAO) -> int:
+    total = 0
+    for prec in _iter_preconditioners(optimizer):
+        for leaf in _iter_leaf_preconditioners(prec):
+            total += int(getattr(leaf, "precond_step", 0))
+    return total
+
+
+def _sync_tensor_average(
+    tensor: torch.Tensor,
+    world_size: int,
+    process_group: Any = None,
+) -> None:
+    dist.all_reduce(tensor, op=dist.ReduceOp.SUM, group=process_group)
+    tensor.div_(world_size)
+
+
+def _sync_leaf_preconditioner(
+    prec: Any,
+    world_size: int,
+    process_group: Any = None,
 ) -> None:
     """
-    Collect tensors from a single Kronecker preconditioner for distributed sync.
+    Average curvature accumulators and recompute eigenfactors locally.
 
-    Eigenfactors (U_l, S_l, U_r, S_r) are always float32 and added to
-    ``tensors_to_sync`` for standard all-reduce.  EMA accumulators are
-    routed to ``tensors_to_sync`` (fp32 path) or ``int8_ema_precs``
-    (int8 path, requires dequantize → reduce → requantize).
+    Eigenvectors themselves are intentionally not averaged: their sign and
+    ordering are not globally stable, so all-reducing them can destroy the
+    orthonormal basis. The mathematically stable object to sync is the EMA
+    curvature estimate.
     """
-    for t in (prec.U_l, prec.S_l, prec.U_r, prec.S_r):
-        tensors_to_sync.append(t)
-    if getattr(prec, "use_int8_ema", False):
-        int8_ema_precs.append((prec, "L"))
-        int8_ema_precs.append((prec, "R"))
-    else:
-        tensors_to_sync.extend([prec.L_ema, prec.R_ema])
+    from .utils import dequantize_sym_int8, quantize_sym_int8
+
+    if getattr(prec, "use_kronecker", False):
+        if getattr(prec, "use_int8_ema", False):
+            L_ema = dequantize_sym_int8(prec.L_ema_q, prec.L_ema_scale)
+            R_ema = dequantize_sym_int8(prec.R_ema_q, prec.R_ema_scale)
+            _sync_tensor_average(L_ema, world_size, process_group)
+            _sync_tensor_average(R_ema, world_size, process_group)
+            prec.L_ema_q, prec.L_ema_scale = quantize_sym_int8(L_ema)
+            prec.R_ema_q, prec.R_ema_scale = quantize_sym_int8(R_ema)
+        else:
+            _sync_tensor_average(prec.L_ema, world_size, process_group)
+            _sync_tensor_average(prec.R_ema, world_size, process_group)
+
+        if int(prec.precond_step) > 0:
+            bias_factor = 1.0 - prec.rho ** int(prec.precond_step)
+            prec._update_eigenfactors(bias_factor)
+        return
+
+    _sync_tensor_average(prec.diag_ema, world_size, process_group)
 
 
-def sync_preconditioners(optimizer: "SCAO", process_group=None) -> None:
+def sync_preconditioners(optimizer: SCAO, process_group: Any = None) -> None:
     """
-    All-reduce preconditioner eigenfactors across all ranks.
+    All-reduce preconditioner curvature EMAs across all ranks.
 
     In FSDP/ZeRO setups where parameters are sharded, each rank computes
     curvature from its local gradient shard.  This function averages those
@@ -83,52 +129,18 @@ def sync_preconditioners(optimizer: "SCAO", process_group=None) -> None:
     if world_size == 1:
         return
 
-    from .utils import dequantize_sym_int8, quantize_sym_int8
+    optimizer.synchronize_precond()
 
-    handles = []
-    tensors_to_sync: list[torch.Tensor] = []
-    int8_ema_precs: list = []  # list of (prec, "L"|"R") for int8 EMA path
-
-    for state in optimizer.state.values():
-        if "preconditioner" not in state:
-            continue
-        prec = state["preconditioner"]
+    for prec in _iter_preconditioners(optimizer):
         if getattr(prec, "use_block_diagonal", False):
-            # Block-diagonal: sync each sub-block independently
             for blk in prec._blocks:
-                if blk.use_kronecker:
-                    _collect_kronecker_tensors(blk, tensors_to_sync, int8_ema_precs)
-                else:
-                    tensors_to_sync.append(blk.diag_ema)
-        elif prec.use_kronecker:
-            _collect_kronecker_tensors(prec, tensors_to_sync, int8_ema_precs)
+                _sync_leaf_preconditioner(blk, world_size, process_group)
+            prec._k = sum(b._k for b in prec._blocks) // max(len(prec._blocks), 1)
         else:
-            tensors_to_sync.append(prec.diag_ema)
-
-    # Batch all-reduce of float32 tensors (eigenfactors + non-int8 EMAs)
-    for t in tensors_to_sync:
-        h = dist.all_reduce(t, op=dist.ReduceOp.SUM, group=process_group, async_op=True)
-        handles.append((h, t))
-
-    for h, t in handles:
-        h.wait()
-        t.div_(world_size)
-
-    # All-reduce int8 EMA accumulators: dequantize → reduce → average → requantize
-    for prec, side in int8_ema_precs:
-        if side == "L":
-            ema_f32 = dequantize_sym_int8(prec.L_ema_q, prec.L_ema_scale)
-            dist.all_reduce(ema_f32, op=dist.ReduceOp.SUM, group=process_group)
-            ema_f32.div_(world_size)
-            prec.L_ema_q, prec.L_ema_scale = quantize_sym_int8(ema_f32)
-        else:
-            ema_f32 = dequantize_sym_int8(prec.R_ema_q, prec.R_ema_scale)
-            dist.all_reduce(ema_f32, op=dist.ReduceOp.SUM, group=process_group)
-            ema_f32.div_(world_size)
-            prec.R_ema_q, prec.R_ema_scale = quantize_sym_int8(ema_f32)
+            _sync_leaf_preconditioner(prec, world_size, process_group)
 
 
-def wrap_scao_for_fsdp(optimizer: "SCAO") -> "SCAO":
+def wrap_scao_for_fsdp(optimizer: SCAO) -> SCAO:
     """
     Register a post-step hook that synchronises preconditioners after each
     curvature update in FSDP training.
@@ -139,21 +151,23 @@ def wrap_scao_for_fsdp(optimizer: "SCAO") -> "SCAO":
     try:
         from torch.distributed.fsdp import FullyShardedDataParallel as FSDP  # noqa: F401
     except ImportError:
-        warnings.warn("torch.distributed.fsdp not available; FSDP wrapping skipped.")
+        warnings.warn(
+            "torch.distributed.fsdp not available; FSDP wrapping skipped.",
+            stacklevel=2,
+        )
         return optimizer
 
     original_step = optimizer.step
+    last_synced_precond_steps = _preconditioner_step_sum(optimizer)
 
-    def patched_step(closure=None):
+    def patched_step(closure: Any = None) -> Any:
+        nonlocal last_synced_precond_steps
         result = original_step(closure)
-        # Synchronise preconditioners on curvature-update steps
-        step = next(
-            (s.get("step", 0) for s in optimizer.state.values() if "step" in s),
-            0,
-        )
-        if step % optimizer.defaults["precond_freq"] == 0:
-            optimizer.synchronize_precond()
+        optimizer.synchronize_precond()
+        precond_steps = _preconditioner_step_sum(optimizer)
+        if precond_steps != last_synced_precond_steps:
             sync_preconditioners(optimizer)
+            last_synced_precond_steps = precond_steps
         return result
 
     optimizer.step = patched_step  # type: ignore[method-assign]

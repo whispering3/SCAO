@@ -51,18 +51,22 @@ v3 patch:
 """
 
 from __future__ import annotations
+
+import warnings
+from typing import cast
+
 import torch
 from torch import Tensor
 
+from .cuda import fused_kronecker_precond as _cuda_fused_precond
 from .utils import (
     adaptive_rank,
-    to_2d,
+    dequantize_sym_int8,
     from_2d,
     low_rank_matrix_power_neg_quarter,
     quantize_sym_int8,
-    dequantize_sym_int8,
+    to_2d,
 )
-from .cuda import fused_kronecker_precond as _cuda_fused_precond
 
 # float32 is the minimum precision required for stable eigendecomposition.
 # bfloat16/float16 are NOT supported by torch.linalg.eigh on CPU.
@@ -122,9 +126,8 @@ class SparsePreconditioner:
         d_min = min(m, n)
         self.k_min = min(k_min, d_min)
         self.k_max = min(k_max, d_min // 2) if d_min > 2 * self.k_min else self.k_min
-        
+
         self.rho = rho
-        self.use_newton_schulz = use_newton_schulz
         # use_int8_ema: store L_ema/R_ema as int8 tensors with float32 scale factors.
         # Reduces EMA memory from (m²+n²)*4 bytes to (m²+n²)*1 + 8 bytes — 4× reduction.
         # Only applied to the Kronecker path (block-diagonal delegates to sub-preconditioners).
@@ -152,13 +155,14 @@ class SparsePreconditioner:
             and max(m, n) <= max_precond_dim
         )
 
-        # For large matrices (min dimension > 512), default to Newton-Schulz
-        # iterations instead of eigendecomposition.  NS stays on-device (no
-        # CPU transfer), is O(m²k) per step vs O(m³) for eigh, and handles
-        # bfloat16 natively — essential for 300M+ parameter transformer layers
-        # where weight matrices can be 1024×4096 or larger.
-        if self.use_kronecker and not use_newton_schulz:
-            use_newton_schulz = min(m, n) > 512
+        if use_newton_schulz:
+            warnings.warn(
+                "use_newton_schulz is not active in the low-rank adaptive "
+                "preconditioner path; falling back to eigendecomposition.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+        self.use_newton_schulz = False
 
         if self.use_block_diagonal:
             # Block-diagonal preconditioning:
@@ -318,7 +322,7 @@ class SparsePreconditioner:
         # Block-diagonal: delegate each slice to its own sub-preconditioner.
         if self.use_block_diagonal:
             offset = 0
-            for bs, blk in zip(self._block_sizes, self._blocks):
+            for bs, blk in zip(self._block_sizes, self._blocks, strict=True):
                 if self._block_dim == 0:
                     g_blk = g2d_f32[offset:offset + bs, :]
                 else:
@@ -493,7 +497,7 @@ class SparsePreconditioner:
         if self.use_block_diagonal:
             result = torch.zeros_like(g2d)
             offset = 0
-            for bs, blk in zip(self._block_sizes, self._blocks):
+            for bs, blk in zip(self._block_sizes, self._blocks, strict=True):
                 if self._block_dim == 0:
                     g_blk = g2d[offset:offset + bs, :]
                     result[offset:offset + bs, :] = blk.precondition(g_blk).to(_PRECOND_DTYPE)
@@ -542,7 +546,7 @@ class SparsePreconditioner:
         if self.use_block_diagonal:
             sq_norms: list[Tensor] = []
             offset = 0
-            for bs, blk in zip(self._block_sizes, self._blocks):
+            for bs, blk in zip(self._block_sizes, self._blocks, strict=True):
                 if self._block_dim == 0:
                     g_blk = g2d[offset:offset + bs, :]
                 else:
@@ -561,7 +565,7 @@ class SparsePreconditioner:
         G_proj = (self.U_l.T @ g2d) @ self.U_r   # (k, k)
         G_scaled = S_l_inv2.unsqueeze(1) * G_proj * S_r_inv2.unsqueeze(0)
 
-        return G_scaled.norm(p="fro")
+        return cast(Tensor, G_scaled.norm(p="fro"))
 
     # ------------------------------------------------------------------
     # State dict helpers (for checkpointing)
@@ -624,7 +628,7 @@ class SparsePreconditioner:
         # eigenfactors are restored to exactly the saved shape below.
         self._k = state["k"]
         if self.use_block_diagonal:
-            for blk, blk_state in zip(self._blocks, state["blocks"]):
+            for blk, blk_state in zip(self._blocks, state["blocks"], strict=True):
                 blk.load_state_dict(blk_state)
         elif self.use_kronecker:
             if self.use_int8_ema:
@@ -645,8 +649,8 @@ class SparsePreconditioner:
 
 
 def _broadcast_precond(
-    precond: "SparsePreconditioner",
-    process_group: "torch.distributed.ProcessGroup | None" = None,
+    precond: SparsePreconditioner,
+    process_group: torch.distributed.ProcessGroup | None = None,
 ) -> None:
     """
     Broadcast all preconditioner state tensors from rank 0 to all ranks.
