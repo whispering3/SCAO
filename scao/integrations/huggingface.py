@@ -56,6 +56,22 @@ def get_scao_optimizer(
     training_args,
     scao_kwargs: dict | None = None,
     no_decay_names: tuple[str, ...] = ("bias", "LayerNorm.weight", "layer_norm.weight"),
+    no_precond_names: tuple[str, ...] = (
+        "embed",
+        "embedding",
+        "embed_tokens",
+        "lm_head",
+        "wte",
+        "wpe",
+    ),
+    adapter_names: tuple[str, ...] = (
+        "adapter",
+        "lora",
+        "ia3",
+        "prefix",
+        "prompt",
+    ),
+    preconditioner_policy: str = "all",
     num_training_steps: int | None = None,
 ):
     """
@@ -70,6 +86,17 @@ def get_scao_optimizer(
         training_args: ``transformers.TrainingArguments`` instance
         scao_kwargs: additional SCAO hyperparameters (override defaults)
         no_decay_names: parameter name substrings exempt from weight decay
+        no_precond_names: parameter name substrings that should skip SCAO
+            preconditioning while still using the optimizer moments. This is
+            useful for large embedding/output matrices in 100B+ models.
+        adapter_names: parameter name substrings used to identify PEFT/adapter
+            parameters for ``preconditioner_policy="adapters_only"``.
+        preconditioner_policy: one of:
+            ``"all"``: precondition all trainable parameters. This is the
+                backwards-compatible default.
+            ``"auto"``: precondition trainable non-embedding parameters.
+            ``"none"``: disable preconditioning for all parameters.
+            ``"adapters_only"``: precondition only adapter/LoRA-style params.
         num_training_steps: explicit scheduler length. Required for an accurate
             scheduler when ``training_args.max_steps`` is not set.
 
@@ -97,20 +124,64 @@ def get_scao_optimizer(
 
     from scao.optimizer import SCAO
 
+    valid_policies = {"auto", "all", "none", "adapters_only"}
+    if preconditioner_policy not in valid_policies:
+        raise ValueError(
+            f"Invalid preconditioner_policy={preconditioner_policy!r}. "
+            f"Expected one of {sorted(valid_policies)}."
+        )
+
+    def should_precondition(name: str) -> bool:
+        if preconditioner_policy == "all":
+            return True
+        if preconditioner_policy == "none":
+            return False
+        if preconditioner_policy == "adapters_only":
+            return any(token in name for token in adapter_names)
+        return not any(token in name for token in no_precond_names)
+
     # Separate parameters with / without weight decay (standard HF split)
-    decay_params, no_decay_params = [], []
+    decay_precond_params, decay_plain_params = [], []
+    no_decay_precond_params, no_decay_plain_params = [], []
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
-        if any(nd in name for nd in no_decay_names):
-            no_decay_params.append(param)
+        use_decay = not any(nd in name for nd in no_decay_names)
+        use_precond = should_precondition(name)
+        if use_decay and use_precond:
+            decay_precond_params.append(param)
+        elif use_decay:
+            decay_plain_params.append(param)
+        elif use_precond:
+            no_decay_precond_params.append(param)
         else:
-            decay_params.append(param)
+            no_decay_plain_params.append(param)
 
-    param_groups = [
-        {"params": decay_params,    "weight_decay": training_args.weight_decay},
-        {"params": no_decay_params, "weight_decay": 0.0},
-    ]
+    param_groups = []
+    if decay_precond_params:
+        param_groups.append({
+            "params": decay_precond_params,
+            "weight_decay": training_args.weight_decay,
+            "preconditioner_enabled": True,
+        })
+    if decay_plain_params:
+        param_groups.append({
+            "params": decay_plain_params,
+            "weight_decay": training_args.weight_decay,
+            "preconditioner_enabled": False,
+        })
+    if no_decay_precond_params:
+        param_groups.append({
+            "params": no_decay_precond_params,
+            "weight_decay": 0.0,
+            "preconditioner_enabled": True,
+        })
+    if no_decay_plain_params:
+        param_groups.append({
+            "params": no_decay_plain_params,
+            "weight_decay": 0.0,
+            "preconditioner_enabled": False,
+        })
 
     defaults: dict[str, Any] = {
         "lr": training_args.learning_rate,
@@ -175,8 +246,32 @@ def _make_scao_trainer_class():
             trainer.train()
         """
 
-        def __init__(self, *args, scao_kwargs: dict | None = None, **kwargs):
+        def __init__(
+            self,
+            *args,
+            scao_kwargs: dict | None = None,
+            preconditioner_policy: str = "all",
+            no_precond_names: tuple[str, ...] = (
+                "embed",
+                "embedding",
+                "embed_tokens",
+                "lm_head",
+                "wte",
+                "wpe",
+            ),
+            adapter_names: tuple[str, ...] = (
+                "adapter",
+                "lora",
+                "ia3",
+                "prefix",
+                "prompt",
+            ),
+            **kwargs,
+        ):
             self._scao_kwargs = scao_kwargs or {}
+            self._scao_preconditioner_policy = preconditioner_policy
+            self._scao_no_precond_names = no_precond_names
+            self._scao_adapter_names = adapter_names
             super().__init__(*args, **kwargs)
 
         def create_optimizer(self):
@@ -185,6 +280,9 @@ def _make_scao_trainer_class():
                     self.model,
                     self.args,
                     scao_kwargs=self._scao_kwargs,
+                    no_precond_names=self._scao_no_precond_names,
+                    adapter_names=self._scao_adapter_names,
+                    preconditioner_policy=self._scao_preconditioner_policy,
                 )
                 self.optimizer = optimizer
             return self.optimizer

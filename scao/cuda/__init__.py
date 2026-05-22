@@ -113,11 +113,11 @@ def _fused_kronecker_precond_pytorch(
         delta = (s_l_inv4[:,None] * s_r_inv4[None,:] - 1) * P
         out   = G + U_l @ delta @ U_r^T
     """
-    P = (U_l.T @ G) @ U_r                                    # (k, k)
-    scale = s_l_inv4.unsqueeze(1) * s_r_inv4.unsqueeze(0)    # (k, k)
-    delta = (scale - 1.0) * P                                 # (k, k)
-    correction = U_l @ delta @ U_r.T                          # (m, n)
-    return G + correction
+    P = torch.mm(torch.mm(U_l.T, G), U_r)                     # (k, k)
+    scale = torch.outer(s_l_inv4, s_r_inv4)                   # (k, k)
+    delta = (scale - 1.0).mul_(P)                             # (k, k)
+    correction_left = torch.mm(U_l, delta)                    # (m, k)
+    return torch.addmm(G, correction_left, U_r.T)             # (m, n)
 
 
 def _low_rank_precond_mm_pytorch(

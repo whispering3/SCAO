@@ -63,7 +63,6 @@ from .utils import (
     adaptive_rank,
     dequantize_sym_int8,
     from_2d,
-    low_rank_matrix_power_neg_quarter,
     quantize_sym_int8,
     to_2d,
 )
@@ -233,6 +232,7 @@ class SparsePreconditioner:
             self.S_l = torch.ones(k_init, device=device, dtype=_PRECOND_DTYPE)
             self.U_r = torch.eye(n, k_init, device=device, dtype=_PRECOND_DTYPE)
             self.S_r = torch.ones(k_init, device=device, dtype=_PRECOND_DTYPE)
+            self._refresh_inverse_spectrum_cache()
         else:
             # Diagonal fallback: maintain per-element variance estimate in float32
             self.diag_ema = torch.zeros(shape, device=device, dtype=_PRECOND_DTYPE)
@@ -241,6 +241,15 @@ class SparsePreconditioner:
 
         # Step counter for this preconditioner (updated externally)
         self.precond_step: int = 0
+
+    def _refresh_inverse_spectrum_cache(self, eps: float = 1e-8) -> None:
+        """Refresh derived inverse spectrum tensors after eigenfactor changes."""
+        if not self.use_kronecker:
+            return
+        self.S_l_inv4 = self.S_l.clamp(min=eps).pow(-0.25)
+        self.S_r_inv4 = self.S_r.clamp(min=eps).pow(-0.25)
+        self.S_l_inv2 = self.S_l.clamp(min=eps).pow(-0.5)
+        self.S_r_inv2 = self.S_r.clamp(min=eps).pow(-0.5)
 
     # ------------------------------------------------------------------
     # R5: k property — safe external rank assignment
@@ -285,6 +294,7 @@ class SparsePreconditioner:
                 self.S_l = self.S_l[:new_k].contiguous()
                 self.U_r = self.U_r[:, :new_k].contiguous()
                 self.S_r = self.S_r[:new_k].contiguous()
+                self._refresh_inverse_spectrum_cache()
             elif new_k > self._k:
                 # Rank increase: clamp to the current tensor width.
                 # _update_eigenfactors will expand to new_k on the next update.
@@ -453,6 +463,7 @@ class SparsePreconditioner:
         self.S_l = S_l_full[:k_new].contiguous()
         self.U_r = U_r_full[:, :k_new].contiguous()
         self.S_r = S_r_full[:k_new].contiguous()
+        self._refresh_inverse_spectrum_cache()
 
     # ------------------------------------------------------------------
     # Preconditioning  (called every optimizer step)
@@ -495,7 +506,7 @@ class SparsePreconditioner:
 
         # Block-diagonal: precondition each slice independently, then reassemble.
         if self.use_block_diagonal:
-            result = torch.zeros_like(g2d)
+            result = torch.empty_like(g2d)
             offset = 0
             for bs, blk in zip(self._block_sizes, self._blocks, strict=True):
                 if self._block_dim == 0:
@@ -513,14 +524,10 @@ class SparsePreconditioner:
             result = g2d / denom
             return from_2d(result, orig_shape).to(orig_dtype)
 
-        eps = 1e-8
-        _, S_l_inv4 = low_rank_matrix_power_neg_quarter(self.U_l, self.S_l, eps)
-        _, S_r_inv4 = low_rank_matrix_power_neg_quarter(self.U_r, self.S_r, eps)
-
-        # Use fused CUDA kernel when available (k ≤ 128) — avoids materialising
+        # Use fused CUDA kernel when available (k <= 32) — avoids materialising
         # the (m,n) correction tensor and reduces memory bandwidth.
         # Falls back to pure PyTorch (inside _cuda_fused_precond) otherwise.
-        G_precond = _cuda_fused_precond(self.U_l, S_l_inv4, self.U_r, S_r_inv4, g2d)
+        G_precond = _cuda_fused_precond(self.U_l, self.S_l_inv4, self.U_r, self.S_r_inv4, g2d)
 
         return from_2d(G_precond, orig_shape).to(orig_dtype)
 
@@ -556,14 +563,12 @@ class SparsePreconditioner:
             return torch.stack(sq_norms).sum().sqrt()
 
         if not self.use_kronecker:
-            denom = self.diag_ema.reshape_as(g2d).pow(0.5).add_(eps)
+            bias = getattr(self, "_diag_bias_factor", 1.0)
+            denom = (self.diag_ema / bias).reshape_as(g2d).pow(0.5).add_(eps)
             return (g2d.pow(2) / denom).sum().sqrt()
 
-        S_l_inv2 = self.S_l.clamp(min=eps).pow(-0.5)
-        S_r_inv2 = self.S_r.clamp(min=eps).pow(-0.5)
-
         G_proj = (self.U_l.T @ g2d) @ self.U_r   # (k, k)
-        G_scaled = S_l_inv2.unsqueeze(1) * G_proj * S_r_inv2.unsqueeze(0)
+        G_scaled = self.S_l_inv2.unsqueeze(1) * G_proj * self.S_r_inv2.unsqueeze(0)
 
         return cast(Tensor, G_scaled.norm(p="fro"))
 
@@ -618,6 +623,8 @@ class SparsePreconditioner:
                 total += self.R_ema.numel() * self.R_ema.element_size()
             for t in (self.U_l, self.S_l, self.U_r, self.S_r):
                 total += t.numel() * t.element_size()
+            for t in (self.S_l_inv4, self.S_r_inv4, self.S_l_inv2, self.S_r_inv2):
+                total += t.numel() * t.element_size()
         else:
             total += self.diag_ema.numel() * self.diag_ema.element_size()
         return total
@@ -644,6 +651,7 @@ class SparsePreconditioner:
             self.S_l = state["S_l"].to(device=self.device, dtype=_PRECOND_DTYPE)
             self.U_r = state["U_r"].to(device=self.device, dtype=_PRECOND_DTYPE)
             self.S_r = state["S_r"].to(device=self.device, dtype=_PRECOND_DTYPE)
+            self._refresh_inverse_spectrum_cache()
         else:
             self.diag_ema.copy_(state["diag_ema"])
 
@@ -717,6 +725,7 @@ def _broadcast_precond(
         dist.broadcast(precond.S_l, src=0, group=process_group)
         dist.broadcast(precond.U_r, src=0, group=process_group)
         dist.broadcast(precond.S_r, src=0, group=process_group)
+        precond._refresh_inverse_spectrum_cache()
 
     else:
         # Diagonal fallback
