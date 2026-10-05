@@ -16,15 +16,15 @@ Run:
     python train_1m.py
 """
 
-import torch
+from datasets import load_dataset
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
-    TrainingArguments,
-    Trainer,
     DataCollatorForLanguageModeling,
+    Trainer,
+    TrainingArguments,
 )
-from datasets import load_dataset
+
 from scao import SCAO
 
 

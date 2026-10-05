@@ -35,13 +35,11 @@ import argparse
 import csv
 import gc
 import math
-import os
 import sys
 import time
 import tracemalloc
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterator
 
 import torch
 import torch.nn as nn
@@ -712,7 +710,7 @@ def main() -> None:
         device = torch.device(args.device)
 
     print(f"\n{'='*60}")
-    print(f"  SCAO Large-Scale Benchmark")
+    print("  SCAO Large-Scale Benchmark")
     print(f"  Device:  {device}")
     print(f"  Scales:  {args.scales}")
     print(f"  Optimizers: {args.optimizers}")

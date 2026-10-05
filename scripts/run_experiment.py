@@ -20,8 +20,6 @@ from __future__ import annotations
 import argparse
 import csv
 import json
-import math
-import os
 import random
 import sys
 import time
@@ -39,7 +37,6 @@ except ImportError:
     _HAS_YAML = False
 
 from scao import SCAO
-
 
 # ---------------------------------------------------------------------------
 # Utilities
@@ -128,7 +125,7 @@ def main() -> None:
 
     out_root = Path(args.out_dir) / Path(args.config).stem
     print(f"\n{'='*60}")
-    print(f"  SCAO Experiment Runner")
+    print("  SCAO Experiment Runner")
     print(f"  Config : {args.config}")
     print(f"  Steps  : {steps}")
     print(f"  Seeds  : {args.seeds}")

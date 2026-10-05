@@ -1,20 +1,23 @@
-import torch
 import argparse
-import time
 import json
 import os
-from transformers import (
-    AutoModelForCausalLM, 
-    AutoTokenizer, 
-    TrainingArguments, 
-    Trainer, 
-    BitsAndBytesConfig, 
-    DataCollatorForLanguageModeling
-)
-from datasets import load_dataset
-from peft import get_peft_model, LoraConfig, prepare_model_for_kbit_training
-from scao import SCAO
+import time
+
+import torch
 import torch_optimizer as optim
+from datasets import load_dataset
+from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+from transformers import (
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    BitsAndBytesConfig,
+    DataCollatorForLanguageModeling,
+    Trainer,
+    TrainingArguments,
+)
+
+from scao import SCAO
+
 
 def get_peak_vram():
     if torch.cuda.is_available():
@@ -29,7 +32,7 @@ def main():
     args_cmd = parser.parse_args()
 
     print(f"🚀 Starting Professional Benchmark: {args_cmd.optimizer.upper()} on {args_cmd.model_id}")
-    
+
     # 1. Model Loading (4-bit)
     tokenizer = AutoTokenizer.from_pretrained(args_cmd.model_id)
     if tokenizer.pad_token is None:
@@ -60,7 +63,7 @@ def main():
     )
     model = get_peft_model(model, lora_config)
     trainable_params = [p for p in model.parameters() if p.requires_grad]
-    
+
     # 3. Dataset
     dataset = load_dataset("wikitext", "wikitext-2-raw-v1", split="train[:1%]")
     def tokenize(example):
@@ -100,7 +103,7 @@ def main():
     start_time = time.time()
     status = "Success"
     error_msg = ""
-    
+
     try:
         print("⚡ Training active! Monitoring performance...")
         trainer.train()
@@ -129,7 +132,7 @@ def main():
     # Append to markdown summary
     summary_path = "benchmark_results.md"
     header_exists = os.path.exists(summary_path) and os.stat(summary_path).st_size > 0
-    
+
     with open(summary_path, "a") as f:
         if not header_exists:
             f.write("# SCAO vs Shampoo Comparison Results\n\n")

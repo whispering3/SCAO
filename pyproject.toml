@@ -105,6 +105,7 @@ exclude = [
 [tool.ruff]
 line-length = 100
 target-version = "py310"
+extend-exclude = ["*.ipynb", "dist", "build", "scao.egg-info"]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "UP", "B", "C4", "T20"]
@@ -116,5 +117,7 @@ ignore = [
 
 [tool.ruff.lint.per-file-ignores]
 "scao/tests/*" = ["T201", "F841"]
-"scao/benchmarks/*" = ["T201"]
+"scao/benchmarks/*" = ["T201", "E402"]
+"benchmark/*" = ["T201", "E402", "F401", "I001"]
+"scripts/*" = ["T201", "E402", "E701", "E702", "B007", "F401", "I001"]
 

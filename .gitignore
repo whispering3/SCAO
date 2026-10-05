@@ -26,6 +26,7 @@ MANIFEST
 .build/
 *.whl
 *.tar.gz
+scao-*/
 
 # Testing
 .tox/

@@ -5,6 +5,24 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.2.2] — 2026-10-04
+
+### Added
+- **Triton JIT Acceleration**: Added OpenAI Triton kernels (`scao/cuda/triton_ops.py`) for GPU acceleration without requiring a precompiled C++/CUDA extension or host `nvcc` compiler.
+- **Axolotl Integration**: Official native support for Axolotl fine-tuning framework (`optimizer: scao`) documented in README and verified with E2E tests.
+- **Cross-Platform CI**: Added Windows runner (`windows-latest`) to GitHub Actions CI matrix to test DDP and file paths natively on Windows.
+- **Python 3.13 Support**: Added Python 3.13 to CI test matrix.
+
+### Changed
+- **Modular Core Architecture**: Refactored `scao/optimizer.py` into focused, reusable modules while preserving 100% backward compatibility:
+  - `scao/filters.py`: Gradient filters (`_SparseGradFilter`, `_DynamicSparseFilter`), adaptive warmup, gSNR element-wise clipping, and lazy triggers.
+  - `scao/presets.py`: Model scale presets (`scao_sub1b` through `scao_125b`).
+  - `scao/optimizer.py`: Lean optimizer step loop and state management.
+- **Strict CI Verification**: Removed `|| true` masking from `ruff` and `mypy` in CI workflows, enforcing zero-regression quality gates.
+- **Repository Hygiene**: Removed legacy build directories and added `scao-*/` to `.gitignore`.
+
+---
+
 ## [0.2.0] — 2026-04-28
 
 ### Added (SCAO v2)
