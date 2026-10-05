@@ -7,7 +7,11 @@ Compiles CUDA fused kernels (nvcc available on Kaggle).
 """
 
 # ── 1. Setup ──────────────────────────────────────────────────────────────────
-import subprocess, sys, os, pathlib
+import os
+import pathlib
+import subprocess
+import sys
+
 
 def run(cmd, **kw):
     print(f"$ {cmd}")
@@ -34,6 +38,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 # Check GPU
 import torch
+
 print(f"\nPyTorch : {torch.__version__}")
 print(f"CUDA    : {torch.cuda.is_available()}")
 if torch.cuda.is_available():
@@ -45,6 +50,7 @@ else:
     print("WARNING: No GPU detected!")
 
 import scao
+
 print(f"SCAO v{scao.__version__} imported OK")
 
 # ── 3. Compile CUDA kernels ───────────────────────────────────────────────────
@@ -96,6 +102,8 @@ else:
 
 # ── 6. Print summary ──────────────────────────────────────────────────────────
 import csv
+
+
 def load_csv(path):
     if not os.path.exists(path): return []
     with open(path) as f: return list(csv.DictReader(f))

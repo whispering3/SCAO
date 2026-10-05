@@ -12,16 +12,16 @@ Run:
     python train_local.py
 """
 
-import torch
+from datasets import load_dataset
+from peft import LoraConfig, TaskType, get_peft_model
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
-    TrainingArguments,
-    Trainer,
     DataCollatorForLanguageModeling,
+    Trainer,
+    TrainingArguments,
 )
-from datasets import load_dataset
-from peft import LoraConfig, get_peft_model, TaskType
+
 from scao import SCAO
 
 

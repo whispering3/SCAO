@@ -287,4 +287,14 @@ def int8_ema_update(
             return ext.int8_ema_update(ema_q, ema_scale, new_val, rho)
         except (AttributeError, RuntimeError):
             pass
+
+    if ema_q.is_cuda:
+        try:
+            from .triton_ops import int8_ema_update_triton
+            res = int8_ema_update_triton(ema_q, ema_scale, new_val, rho)
+            if res is not None:
+                return res
+        except Exception:
+            pass
+
     return _int8_ema_update_pytorch(ema_q, ema_scale, new_val, rho)

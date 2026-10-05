@@ -30,8 +30,6 @@ from __future__ import annotations
 
 import argparse
 import csv
-import math
-import os
 import statistics
 import sys
 import textwrap
@@ -42,7 +40,7 @@ ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT))
 
 # Reuse the full benchmark infrastructure from gpt_scale_benchmark.py
-from scao.benchmarks.gpt_scale_benchmark import (   # noqa: E402
+from scao.benchmarks.gpt_scale_benchmark import (  # noqa: E402
     SCALE_CONFIGS,
     load_data,
     run_single,
@@ -199,7 +197,7 @@ def main() -> None:
     w = 88
     lines: list[str] = []
     lines.append("=" * w)
-    lines.append(f"  SCAO Large-Scale Benchmark Results")
+    lines.append("  SCAO Large-Scale Benchmark Results")
     lines.append(f"  Scales: {scales}   Seeds: {seeds}   Device: {device}")
     lines.append("─" * w)
     lines.append(

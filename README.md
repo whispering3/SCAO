@@ -6,10 +6,12 @@
 [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.19870556.svg)](https://doi.org/10.5281/zenodo.19870556)
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue)](https://python.org)
 [![PyTorch](https://img.shields.io/badge/pytorch-2.0%2B-orange)](https://pytorch.org)
+[![Axolotl](https://img.shields.io/badge/Axolotl-supported-blueviolet.svg)](https://github.com/axolotl-ai-cloud/axolotl/pull/3624)
 
 > **A second-order PyTorch optimizer that delivers Shampoo-quality preconditioned gradients at near-AdamW memory and throughput cost.**  
 > Drop-in replacement for `AdamW`. One-line change. Real gains.  
-> **Now available on PyPI:** `pip install scao`
+> **Now available on PyPI:** `pip install scao`  
+> **Native support:** [Axolotl](https://github.com/axolotl-ai-cloud/axolotl/pull/3624) (`optimizer: scao`) and HuggingFace `Trainer`.
 
 ---
 
@@ -555,6 +557,26 @@ trainer = SCAOTrainer(
 trainer.train()
 ```
 
+### Axolotl (LLM Fine-Tuning)
+
+SCAO is integrated as a native custom optimizer in [Axolotl](https://github.com/axolotl-ai-cloud/axolotl) (PR [#3624](https://github.com/axolotl-ai-cloud/axolotl/pull/3624)).
+
+To use SCAO in your Axolotl YAML configuration:
+
+```yaml
+# In your Axolotl config.yaml
+optimizer: scao
+
+# Optional SCAO hyperparameters passed through optim_args
+optim_args:
+  precond_freq: 20       # Curvature update frequency
+  k_min: 8               # Minimum rank
+  k_max: 64              # Maximum rank
+  sparsity: 0.7          # Base gradient sparsity
+  use_int8_ema: true     # 4x memory reduction on curvature buffers (recommended for LoRA/QLoRA)
+  dynamic_sparsity: true # Adaptive per-layer gradient sparsity
+```
+
 ### Monitoring and diagnostics
 
 ```python
@@ -687,20 +709,26 @@ Open [`scripts/scao_colab_benchmark.ipynb`](scripts/scao_colab_benchmark.ipynb) 
 ```
 scao/                               # Core library
 ├── optimizer.py                    # SCAO main class — drop-in for AdamW
+├── filters.py                      # Gradient filters: dynamic sparsity, gSNR clipping, warmup
+├── presets.py                      # Scale presets: scao_sub1b through scao_125b
 ├── preconditioner.py               # SparsePreconditioner: Kronecker low-rank + int8 EMA
 ├── utils.py                        # adaptive_rank, quantize_sym_int8, dequantize_sym_int8
 ├── distributed.py                  # ZeRO-3 / FSDP helpers
 ├── logging.py                      # ConsoleLogger, TensorBoardLogger, WandbLogger
 ├── integrations/
-│   └── huggingface.py              # SCAOTrainer, SCAOMonitorCallback
+│   └── huggingface.py              # SCAOTrainer, get_scao_optimizer, SCAOMonitorCallback
 ├── benchmarks/
 │   └── gpt_scale_benchmark.py      # Multi-scale GPT: SCAO vs AdamW vs SCAO-int8
 ├── tests/
-│   ├── test_optimizer.py           # 40 optimizer correctness tests
+│   ├── test_optimizer.py           # 40+ optimizer correctness tests
+│   ├── test_ddp.py                 # DistributedDataParallel tests (Gloo / CPU)
+│   ├── test_huggingface_integration.py # HF Trainer & PEFT integration tests
+│   ├── test_scale_planner.py       # Memory & scaling verification tests
 │   └── test_profiling.py           # 26 memory + timing profiling tests
 └── cuda/
     ├── low_rank_ops.cu             # Fused CUDA kernels: tiled GEMM, Kronecker precond, int8 EMA
-    ├── __init__.py                 # fused_kronecker_precond(), int8_ema_update(), truncated_eigh()
+    ├── triton_ops.py               # Triton JIT kernels for GPU acceleration without nvcc
+    ├── __init__.py                 # fused_kronecker_precond(), int8_ema_update()
     └── setup.py                    # nvcc build (sm_70/75/80/86/89/90)
 
 scao_benchmarks_t4/                 # Unified T4/Colab benchmark suite

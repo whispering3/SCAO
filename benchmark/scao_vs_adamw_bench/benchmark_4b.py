@@ -1,15 +1,24 @@
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer, TrainingArguments, Trainer, BitsAndBytesConfig, DataCollatorForLanguageModeling
 from datasets import load_dataset
-from peft import get_peft_model, LoraConfig, prepare_model_for_kbit_training
-from scao import SCAO # Your 2nd-order optimizer implementation
+from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+from transformers import (
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    BitsAndBytesConfig,
+    DataCollatorForLanguageModeling,
+    Trainer,
+    TrainingArguments,
+)
+
+from scao import SCAO  # Your 2nd-order optimizer implementation
+
 
 def main():
     print("🚀 Starting 4B-Scale Benchmark for SCAO...")
-    
+
     # Using Qwen 2.5 3B model (optimal for the 4B category tests)
     model_id = "Qwen/Qwen2.5-3B"
-    
+
     tokenizer = AutoTokenizer.from_pretrained(model_id)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -30,7 +39,7 @@ def main():
 
     print("🧠 Initializing LoRA adapters...")
     model = prepare_model_for_kbit_training(model)
-    
+
     lora_config = LoraConfig(
         r=16,
         lora_alpha=32,
@@ -48,10 +57,10 @@ def main():
     print("📚 Loading dataset...")
     # Using wikitext-2 for consistency across benchmarks
     dataset = load_dataset("wikitext", "wikitext-2-raw-v1", split="train[:5%]")
-    
+
     def tokenize(example):
         return tokenizer(example["text"], padding="max_length", truncation=True, max_length=256)
-    
+
     tokenized_dataset = dataset.map(tokenize, batched=True)
 
     print("⚙️ Injecting SCAO Optimizer...")

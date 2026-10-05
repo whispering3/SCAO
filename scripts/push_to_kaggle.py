@@ -11,8 +11,13 @@ Requer:
     C:\\Users\\<user>\\.kaggle\\kaggle.json  com  {"username":"...","key":"..."}
 """
 
-import json, os, sys, zipfile, requests, pathlib, time
-from base64 import b64encode
+import json
+import pathlib
+import sys
+import time
+import zipfile
+
+import requests
 
 # ── Load credentials ──────────────────────────────────────────────────────────
 CRED_PATH = pathlib.Path.home() / ".kaggle" / "kaggle.json"
@@ -192,10 +197,10 @@ else:
 
 if push_r.status_code in (200, 201):
     info = push_r.json()
-    print(f"Kernel pushed successfully!")
+    print("Kernel pushed successfully!")
     print(f"URL: https://www.kaggle.com/code/{USERNAME}/{KERNEL_SLUG}")
     print(f"Version: {info.get('versionNumber', '?')}")
-    print(f"\nThe kernel will start running automatically on a T4 GPU.")
+    print("\nThe kernel will start running automatically on a T4 GPU.")
     print(f"Check status at: https://www.kaggle.com/code/{USERNAME}/{KERNEL_SLUG}")
 else:
     print(f"ERROR pushing kernel: {push_r.status_code} {push_r.text}")
