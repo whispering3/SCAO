@@ -5,7 +5,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
-## [0.2.2] — 2026-10-04
+## [0.2.3] — 2026-10-04
 
 ### Added
 - **Triton JIT Acceleration**: Added OpenAI Triton kernels (`scao/cuda/triton_ops.py`) for GPU acceleration without requiring a precompiled C++/CUDA extension or host `nvcc` compiler.
