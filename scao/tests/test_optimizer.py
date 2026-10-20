@@ -878,6 +878,31 @@ class TestBlockDiagonal:
 class TestDistributed:
     """Verify distributed utilities are safe in single-process mode."""
 
+    @pytest.mark.parametrize("use_int8_ema", [False, True])
+    def test_fsdp_sync_accepts_one_sided_wide_lora_state(self, monkeypatch, use_int8_ema):
+        """FSDP/ZeRO sync must not access the omitted LoRA rank-side factor."""
+        from scao import distributed
+        from scao.preconditioner import SparsePreconditioner
+
+        precond = SparsePreconditioner(
+            torch.randn(128, 16),
+            max_precond_dim=256,
+            k_min=4,
+            factor_mode="wide",
+            use_int8_ema=use_int8_ema,
+        )
+        calls: list[torch.Tensor] = []
+        monkeypatch.setattr(
+            distributed,
+            "_sync_tensor_average",
+            lambda tensor, *_args: calls.append(tensor),
+        )
+
+        distributed._sync_leaf_preconditioner(precond, world_size=2)
+
+        assert len(calls) == 1
+        assert not hasattr(precond, "R_ema_q" if precond._tracks_left else "L_ema_q")
+
     def test_sync_preconditioners_noop_without_dist(self):
         """sync_preconditioners should be a no-op when dist is not initialized."""
         from scao.distributed import sync_preconditioners

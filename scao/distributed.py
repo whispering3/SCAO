@@ -85,15 +85,22 @@ def _sync_leaf_preconditioner(
 
     if getattr(prec, "use_kronecker", False):
         if getattr(prec, "use_int8_ema", False):
-            L_ema = dequantize_sym_int8(prec.L_ema_q, prec.L_ema_scale)
-            R_ema = dequantize_sym_int8(prec.R_ema_q, prec.R_ema_scale)
-            _sync_tensor_average(L_ema, world_size, process_group)
-            _sync_tensor_average(R_ema, world_size, process_group)
-            prec.L_ema_q, prec.L_ema_scale = quantize_sym_int8(L_ema)
-            prec.R_ema_q, prec.R_ema_scale = quantize_sym_int8(R_ema)
+            # ``factor_mode="wide"`` tracks only the wide matrix dimension.
+            # Do not access the intentionally absent rank-side EMA while
+            # synchronising LoRA state under FSDP/ZeRO.
+            if getattr(prec, "_tracks_left", False):
+                L_ema = dequantize_sym_int8(prec.L_ema_q, prec.L_ema_scale)
+                _sync_tensor_average(L_ema, world_size, process_group)
+                prec.L_ema_q, prec.L_ema_scale = quantize_sym_int8(L_ema)
+            if getattr(prec, "_tracks_right", False):
+                R_ema = dequantize_sym_int8(prec.R_ema_q, prec.R_ema_scale)
+                _sync_tensor_average(R_ema, world_size, process_group)
+                prec.R_ema_q, prec.R_ema_scale = quantize_sym_int8(R_ema)
         else:
-            _sync_tensor_average(prec.L_ema, world_size, process_group)
-            _sync_tensor_average(prec.R_ema, world_size, process_group)
+            if getattr(prec, "_tracks_left", False):
+                _sync_tensor_average(prec.L_ema, world_size, process_group)
+            if getattr(prec, "_tracks_right", False):
+                _sync_tensor_average(prec.R_ema, world_size, process_group)
 
         if int(prec.precond_step) > 0:
             bias_factor = 1.0 - prec.rho ** int(prec.precond_step)
