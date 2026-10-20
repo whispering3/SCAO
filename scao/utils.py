@@ -190,7 +190,7 @@ def quantize_sym_int8(x: Tensor) -> tuple[Tensor, float]:
     return q, scale
 
 
-def dequantize_sym_int8(q: Tensor, scale: float) -> Tensor:
+def dequantize_sym_int8(q: Tensor, scale: float | Tensor) -> Tensor:
     """
     Dequantize int8 tensor back to float32.
 

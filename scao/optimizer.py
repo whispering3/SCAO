@@ -12,6 +12,9 @@ New in v3:
   R4  gSNR clipping     — element-wise SNR mask before the parameter update
   R5  Adaptive rank     — adjusts preconditioner k proportional to layer activity
 
+The default parameter update is AdamW. Curvature changes the gradient supplied
+to AdamW after warmup, rather than adding another moment estimator.
+
 Scale presets
 -------------
   <1B   scao_sub1b()   k_min=4, sparsity=0.4, lookahead disabled
@@ -107,17 +110,18 @@ class SCAO(Optimizer):
         tau: float | None = 1.0,
         warmup_steps: int = 100,
         blend_steps: int = 50,
-        min_precond_updates: int = 10,
+        min_precond_updates: int = 2,
         max_precond_dim: int = 4096,
         use_newton_schulz: bool = False,
         use_int8_ema: bool = False,
         async_precond: bool = True,
         beta3: float = 0.99,
-        sparsity: float = 0.7,
-        noise_std_init: float = 0.01,
+        sparsity: float = 0.0,
+        noise_std_init: float = 0.0,
         noise_anneal: float = 0.998,
-        lars_coeff: float = 1e-3,
-        lookahead_k: int = 5,
+        noise_relative: bool = False,
+        lars_coeff: float = 0.0,
+        lookahead_k: int = 0,
         lookahead_alpha: float = 0.5,
         # v3 (Disabled by default to match v2 memory footprint)
         dynamic_sparsity: bool = False,
@@ -131,6 +135,10 @@ class SCAO(Optimizer):
         gsnr_threshold: float = 0.5,
         adaptive_rank: bool = False,
         preconditioner_enabled: bool = True,
+        factor_mode: str = "full",
+        curvature_mode: str = "dense",
+        curvature_rank: int | None = None,
+        update_rule: str = "adamw",
     ) -> None:
         if lr < 0:
             raise ValueError(f"Invalid lr: {lr}")
@@ -140,6 +148,25 @@ class SCAO(Optimizer):
             raise ValueError(f"Invalid beta2: {betas[1]}")
         if not (0.0 <= beta3 < 1.0):
             raise ValueError(f"Invalid beta3: {beta3}")
+        if precond_freq < 1:
+            raise ValueError(f"precond_freq must be >= 1, got {precond_freq}")
+        if min_precond_updates < 0:
+            raise ValueError(
+                f"min_precond_updates must be >= 0, got {min_precond_updates}"
+            )
+        if not 0.0 <= sparsity < 1.0:
+            raise ValueError(f"sparsity must be in [0, 1), got {sparsity}")
+        if noise_std_init < 0.0:
+            raise ValueError(f"noise_std_init must be >= 0, got {noise_std_init}")
+        if factor_mode not in {"full", "wide"}:
+            raise ValueError("factor_mode must be 'full' or 'wide'")
+        if update_rule != "adamw":
+            raise ValueError("Only the stable update_rule='adamw' is supported")
+        if curvature_mode != "dense" or curvature_rank is not None:
+            raise ValueError(
+                "Only the stable dense curvature path is supported; "
+                "use curvature_mode='dense' and curvature_rank=None"
+            )
 
         defaults = {
             "lr": lr, "betas": betas, "eps": eps, "weight_decay": weight_decay,
@@ -150,6 +177,10 @@ class SCAO(Optimizer):
             "max_precond_dim": max_precond_dim, "use_newton_schulz": use_newton_schulz,
             "use_int8_ema": use_int8_ema, "beta3": beta3, "lars_coeff": lars_coeff,
             "preconditioner_enabled": preconditioner_enabled,
+            "factor_mode": factor_mode,
+            "curvature_mode": curvature_mode,
+            "curvature_rank": curvature_rank,
+            "update_rule": update_rule,
         }
         super().__init__(params, defaults)
 
@@ -162,6 +193,7 @@ class SCAO(Optimizer):
         self._global_step: int = 0
         self._noise_std: float = noise_std_init
         self._noise_anneal: float = noise_anneal
+        self._noise_relative: bool = noise_relative
         self._lookahead_k: int = lookahead_k
         self._lookahead_alpha: float = lookahead_alpha
         self._slow_weights: dict[int, Tensor] = {}
@@ -256,11 +288,6 @@ class SCAO(Optimizer):
                                             memory_format=torch.preserve_format)
         state["exp_avg_sq"] = torch.zeros_like(p, dtype=torch.float32,
                                                memory_format=torch.preserve_format)
-        # Adan third moment: tracks gradient delta g_t - g_{t-1}
-        state["exp_avg_diff"] = torch.zeros_like(p, dtype=torch.float32,
-                                                 memory_format=torch.preserve_format)
-        state["prev_grad"] = torch.zeros_like(p, dtype=torch.float32,
-                                              memory_format=torch.preserve_format)
         if group.get("preconditioner_enabled", True):
             state["preconditioner"] = SparsePreconditioner(
                 param=p,
@@ -271,6 +298,9 @@ class SCAO(Optimizer):
                 max_precond_dim=group["max_precond_dim"],
                 use_newton_schulz=group["use_newton_schulz"],
                 use_int8_ema=group["use_int8_ema"],
+                factor_mode=group["factor_mode"],
+                curvature_mode=group["curvature_mode"],
+                curvature_rank=group["curvature_rank"],
             )
 
     # -----------------------------------------------------------------------
@@ -285,6 +315,18 @@ class SCAO(Optimizer):
         # Slow EMA avoids overreaction to single noisy batches
         self._global_norm_ema = 0.95 * self._global_norm_ema + 0.05 * avg
         return avg
+
+    def _noise_scale_for(self, grad: Tensor) -> float:
+        """Return the current additive-noise scale for one effective gradient.
+
+        Relative noise is expressed as a fraction of the gradient RMS, making
+        the same configuration meaningful across LoRA adapters with very
+        different gradient magnitudes. It is opt-in; zero noise remains the
+        default for reproducible baselines.
+        """
+        if not self._noise_relative:
+            return self._noise_std
+        return self._noise_std * float(grad.norm()) / math.sqrt(grad.numel())
 
     # -----------------------------------------------------------------------
     # Main step
@@ -356,7 +398,6 @@ class SCAO(Optimizer):
     def _step_group(self, group: dict, avg_norm: float) -> None:
         lr           = group["lr"]
         beta1, beta2 = group["betas"]
-        beta3        = group["beta3"]
         eps          = group["eps"]
         weight_decay = group["weight_decay"]
         precond_freq = group["precond_freq"]
@@ -380,6 +421,11 @@ class SCAO(Optimizer):
             grad = p.grad.float()
             grad_norm = float(grad.norm())
 
+            # Optional research features are deliberately opt-in.  In particular,
+            # absolute noise is unsafe for LoRA gradients, whose scale is often
+            # orders of magnitude below a generic noise standard deviation.
+            # Keep curvature and update statistics on the same effective gradient.
+            #
             # R2: instantiate filter type once per parameter
             if self._sparsity > 0.0:
                 if pid not in self._sparse_filters:
@@ -391,8 +437,9 @@ class SCAO(Optimizer):
                         self._sparse_filters[pid] = _SparseGradFilter(self._sparsity)
                 grad = self._sparse_filters[pid](grad)
 
-            if self._noise_std > 1e-9:
-                grad = grad + torch.randn_like(grad) * self._noise_std
+            noise_scale = self._noise_scale_for(grad)
+            if noise_scale > 1e-9:
+                grad = grad + torch.randn_like(grad) * noise_scale
 
             # Decoupled weight decay applied before the gradient step (AdamW-style)
             if weight_decay != 0.0:
@@ -400,8 +447,6 @@ class SCAO(Optimizer):
 
             exp_avg      = state["exp_avg"]
             exp_avg_sq   = state["exp_avg_sq"]
-            exp_avg_diff = state["exp_avg_diff"]
-            prev_grad    = state["prev_grad"]
             precond: SparsePreconditioner | None = state.get("preconditioner")
 
             if precond is not None:
@@ -423,13 +468,12 @@ class SCAO(Optimizer):
                 denom = (exp_avg_sq.sqrt() / math.sqrt(bc2)).add_(eps)
                 # Accumulate curvature during warmup so Phase 2 starts warm
                 if precond is not None and step % precond_freq == 0:
-                    self._update_precond_async(precond, p.grad)
+                    self._update_precond_async(precond, grad)
                 p.add_((exp_avg / denom).to(p.dtype), alpha=-(lr / bc1))
-                prev_grad.copy_(grad)
                 continue
 
             # -------------------------------------------------------------------
-            # Phase 2: preconditioned Adan update
+            # Phase 2: preconditioned update
             # -------------------------------------------------------------------
 
             if not state.get("scao_phase_started", False):
@@ -450,9 +494,9 @@ class SCAO(Optimizer):
             else:
                 should_update = (step % precond_freq == 0)
 
-            g_precond = precond.precondition(p.grad) if precond is not None else grad
+            g_precond = precond.precondition(grad) if precond is not None else grad
             if tau is not None and precond is not None:
-                g_precond = self._curvature_clip(g_precond, precond, p.grad, tau, eps)
+                g_precond = self._curvature_clip(g_precond, precond, grad, tau, eps)
 
             # Linear blend from raw gradient to preconditioned over blend_steps,
             # preventing a cold-start spike at the Phase 1→2 transition
@@ -460,25 +504,14 @@ class SCAO(Optimizer):
             blend = min(1.0, scao_step / blend_steps) if blend_steps > 0 else 1.0
             g_eff = blend * g_precond.float() + (1.0 - blend) * grad
 
-            # Adan: three-term momentum with gradient delta
-            grad_delta = grad - prev_grad
-            prev_grad.copy_(grad)
-
             exp_avg.mul_(beta1).add_(g_eff, alpha=1.0 - beta1)
-            exp_avg_diff.mul_(beta3).add_(grad_delta, alpha=1.0 - beta3)
-            g_adan = g_eff + (1.0 - beta3) * grad_delta
-            exp_avg_sq.mul_(beta2).addcmul_(g_adan, g_adan, value=1.0 - beta2)
 
-            # Bias correction uses global step, not scao_step: moments accumulated
-            # since step 1, so (1 - β^t) is the correct denominator
+            # Bias correction uses the global step because the moment buffers
+            # were already updated during warmup.
             bc1 = 1.0 - beta1 ** step
             bc2 = 1.0 - beta2 ** step
-            bc3 = 1.0 - beta3 ** step
-
-            m_hat  = exp_avg      / bc1
-            dm_hat = exp_avg_diff / bc3
-            v_hat  = exp_avg_sq   / bc2
-            update = (m_hat + (1.0 - beta3) * dm_hat) / v_hat.sqrt().add_(eps)
+            exp_avg_sq.mul_(beta2).addcmul_(g_eff, g_eff, value=1.0 - beta2)
+            update = (exp_avg / bc1) / ((exp_avg_sq / bc2).sqrt().add_(eps))
 
             # R4: element-wise SNR mask applied to the final update direction.
             # Evaluated after moments are updated so the SNR estimate reflects current
@@ -496,7 +529,7 @@ class SCAO(Optimizer):
             # current factors. Async work can overlap the remaining optimizer
             # bookkeeping and is fenced at the start of the next step.
             if should_update and precond is not None:
-                self._update_precond_async(precond, p.grad)
+                self._update_precond_async(precond, grad)
 
     # -----------------------------------------------------------------------
     # Helpers
@@ -617,6 +650,12 @@ class SCAO(Optimizer):
         extra_precond  = state_dict.pop("_scao_precond",  {})
         runtime        = state_dict.pop("_scao_runtime",  {})
         super().load_state_dict(state_dict)
+        for group in self.param_groups:
+            # Older checkpoints did not record the update rule. Load them on
+            # the supported AdamW path rather than reviving a retired update.
+            group["update_rule"] = "adamw"
+            group.setdefault("curvature_mode", "dense")
+            group.setdefault("curvature_rank", None)
         for idx, state in enumerate(self.state.values()):
             if idx in extra_precond and "preconditioner" in state:
                 state["preconditioner"].load_state_dict(extra_precond[idx])

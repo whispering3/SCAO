@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "scao"
-version = "0.2.3"
-description = "Sparse Curvature-Aware Adaptive Optimizer — second-order training at near-AdamW cost"
+version = "0.2.4"
+description = "Sparse curvature-aware optimizer for PyTorch"
 readme = "README.md"
 requires-python = ">=3.10"
 license = "Apache-2.0"
@@ -43,6 +43,7 @@ Paper = "https://doi.org/10.5281/zenodo.19839495"
 [project.scripts]
 scao-scale-planner = "scao.tools.scale_planner:main"
 scao-preconditioner-bench = "scao.tools.preconditioner_microbench:main"
+scao-build-cuda = "scao.cuda.build:main"
 
 [project.optional-dependencies]
 dev = [

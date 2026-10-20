@@ -27,7 +27,7 @@ import torch.nn as nn
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
-from scao import SCAO, scao_1b, scao_7b, scao_40b, scao_125b
+from scao import SCAO, scao_1b, scao_3b_low_memory, scao_7b, scao_40b, scao_125b
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -65,6 +65,34 @@ class TestSCAOBasic:
         model = nn.Linear(32, 16)
         opt = SCAO(model.parameters(), lr=1e-3)
         assert opt is not None
+        assert opt._noise_std == 0.0
+        assert opt._sparsity == 0.0
+        assert opt._lookahead_k == 0
+
+    def test_rejects_invalid_preconditioner_and_filter_values(self):
+        model = nn.Linear(8, 4)
+        with pytest.raises(ValueError, match="precond_freq"):
+            SCAO(model.parameters(), precond_freq=0)
+        with pytest.raises(ValueError, match="sparsity"):
+            SCAO(model.parameters(), sparsity=1.0)
+        with pytest.raises(ValueError, match="noise_std_init"):
+            SCAO(model.parameters(), noise_std_init=-0.1)
+
+    def test_relative_noise_scales_with_gradient_rms(self):
+        model = nn.Linear(2, 2)
+        opt = SCAO(
+            model.parameters(),
+            noise_std_init=0.1,
+            noise_relative=True,
+        )
+        grad = torch.full((2, 2), 4.0)
+        assert opt._noise_scale_for(grad) == pytest.approx(0.4)
+
+    def test_absolute_noise_remains_backward_compatible(self):
+        model = nn.Linear(2, 2)
+        opt = SCAO(model.parameters(), noise_std_init=0.1)
+        grad = torch.full((2, 2), 4.0)
+        assert opt._noise_scale_for(grad) == pytest.approx(0.1)
 
     def test_instantiation_custom_hyperparams(self):
         model = nn.Linear(32, 16)
@@ -115,22 +143,85 @@ class TestSCAOBasic:
         loss_val = opt.step(closure)
         assert loss_val is not None
 
+    def test_default_update_rule_is_adamw_without_adan_buffers(self):
+        parameter = nn.Parameter(torch.randn(4, 4))
+        optimizer = SCAO(
+            [{"params": [parameter], "preconditioner_enabled": False}],
+            lr=1e-3,
+            warmup_steps=0,
+            async_precond=False,
+        )
+        parameter.grad = torch.randn_like(parameter)
+        optimizer.step()
+
+        state = optimizer.state[parameter]
+        assert optimizer.param_groups[0]["update_rule"] == "adamw"
+        assert "exp_avg_diff" not in state
+        assert "prev_grad" not in state
+
+    def test_adamw_update_rule_matches_torch_adamw_without_preconditioner(self):
+        torch.manual_seed(123)
+        scao_parameter = nn.Parameter(torch.randn(4, 4))
+        adam_parameter = nn.Parameter(scao_parameter.detach().clone())
+        scao_optimizer = SCAO(
+            [{"params": [scao_parameter], "preconditioner_enabled": False}],
+            lr=3e-4,
+            weight_decay=0.01,
+            warmup_steps=0,
+            tau=None,
+            async_precond=False,
+        )
+        adam_optimizer = torch.optim.AdamW(
+            [adam_parameter], lr=3e-4, weight_decay=0.01, foreach=False
+        )
+
+        for _ in range(4):
+            gradient = torch.randn_like(scao_parameter)
+            scao_parameter.grad = gradient.clone()
+            adam_parameter.grad = gradient.clone()
+            scao_optimizer.step()
+            adam_optimizer.step()
+
+        assert torch.allclose(scao_parameter, adam_parameter, atol=1e-7, rtol=1e-6)
+
+    def test_retired_adan_update_rule_is_rejected(self):
+        parameter = nn.Parameter(torch.randn(4, 4))
+        with pytest.raises(ValueError, match="stable update_rule"):
+            SCAO(
+                [{"params": [parameter], "preconditioner_enabled": False}],
+                warmup_steps=0,
+                update_rule="adan",
+                async_precond=False,
+            )
+
     def test_scale_presets_use_documented_hyperparams(self):
         model = nn.Linear(8, 4)
         opt_1b = scao_1b(model, async_precond=False)
         assert opt_1b.param_groups[0]["lr"] == pytest.approx(3e-4)
         assert opt_1b.param_groups[0]["precond_freq"] == 8
-        assert opt_1b._dynamic_sparsity is True
+        assert opt_1b._dynamic_sparsity is False
 
         opt_7b = scao_7b(model, async_precond=False)
         assert opt_7b.param_groups[0]["precond_freq"] == 15
-        assert opt_7b._use_gsnr_clip is True
-        assert opt_7b._adaptive_rank is True
+        assert opt_7b._use_gsnr_clip is False
+        assert opt_7b._adaptive_rank is False
+
+        opt_3b = __import__("scao").scao_3b(model, async_precond=False)
+        assert opt_3b.param_groups[0]["max_precond_dim"] == 256
+        assert opt_3b.param_groups[0]["use_int8_ema"] is True
+        assert opt_3b.param_groups[0]["min_precond_updates"] == 2
+        assert opt_3b.param_groups[0]["factor_mode"] == "wide"
+
+        opt_3b_low_memory = scao_3b_low_memory(model, async_precond=False)
+        assert opt_3b_low_memory.param_groups[0]["max_precond_dim"] == 128
+        assert opt_3b_low_memory.param_groups[0]["precond_freq"] == 20
+        assert opt_3b_low_memory.param_groups[0]["use_int8_ema"] is True
+        assert opt_3b_low_memory.param_groups[0]["factor_mode"] == "wide"
 
         opt_40b = scao_40b(model, async_precond=False)
         assert opt_40b.param_groups[0]["lr"] == pytest.approx(5e-5)
-        assert opt_40b._lazy_precond is True
-        assert opt_40b._gsnr_threshold == pytest.approx(0.5)
+        assert opt_40b._lazy_precond is False
+        assert opt_40b._use_gsnr_clip is False
 
     def test_scale_presets_accept_parameter_iterables(self):
         model = nn.Linear(8, 4)
@@ -359,6 +450,29 @@ class TestWeightDecay:
 
 
 class TestCheckpointing:
+    def test_legacy_checkpoint_loads_on_supported_update_rule(self):
+        """Missing update metadata must not re-enable a retired update rule."""
+        parameter = nn.Parameter(torch.randn(4, 4))
+        optimizer = SCAO(
+            [{"params": [parameter], "preconditioner_enabled": False}],
+            warmup_steps=0,
+            async_precond=False,
+        )
+        parameter.grad = torch.randn_like(parameter)
+        optimizer.step()
+        legacy_state = copy.deepcopy(optimizer.state_dict())
+        legacy_state["param_groups"][0].pop("update_rule")
+
+        restored_parameter = nn.Parameter(parameter.detach().clone())
+        restored_optimizer = SCAO(
+            [{"params": [restored_parameter], "preconditioner_enabled": False}],
+            warmup_steps=0,
+            async_precond=False,
+        )
+        restored_optimizer.load_state_dict(legacy_state)
+
+        assert restored_optimizer.param_groups[0]["update_rule"] == "adamw"
+
     def test_save_load_roundtrip(self):
         """State dict save/load should produce identical optimizer state."""
         torch.manual_seed(7)
@@ -687,6 +801,60 @@ class TestBlockDiagonal:
         prec2.load_state_dict(state)
         g2 = prec2.precondition(g)
         assert torch.allclose(g1, g2, atol=1e-5)
+
+    @pytest.mark.parametrize("shape,tracked_side", [((128, 16), "left"), ((16, 128), "right")])
+    def test_wide_factor_mode_omits_rank_side_curvature(self, shape, tracked_side):
+        """LoRA-wide mode retains only curvature state for the wide matrix side."""
+        from scao.preconditioner import SparsePreconditioner
+
+        p = torch.randn(shape)
+        full = SparsePreconditioner(p, max_precond_dim=256, k_min=4, use_int8_ema=True)
+        wide = SparsePreconditioner(
+            p, max_precond_dim=256, k_min=4, use_int8_ema=True, factor_mode="wide"
+        )
+        assert wide.memory_bytes() < full.memory_bytes()
+        assert wide._tracks_left is (tracked_side == "left")
+        assert wide._tracks_right is (tracked_side == "right")
+        assert not hasattr(wide, "R_ema_q" if tracked_side == "left" else "L_ema_q")
+
+        gradient = torch.randn_like(p)
+        wide.update_curvature(gradient)
+        output = wide.precondition(gradient)
+        assert torch.isfinite(output).all()
+
+        # The optimized wide path must preserve the one-sided low-rank update
+        # exactly: G + U ((S^-1/4 - I) * (U.T G)), or its right-side analogue.
+        g2d = gradient.float()
+        if tracked_side == "left":
+            expected = g2d + wide.U_l @ (
+                wide.S_l_correction.unsqueeze(1) * (wide.U_l.T @ g2d)
+            )
+        else:
+            expected = g2d + (
+                (g2d @ wide.U_r) * wide.S_r_correction.unsqueeze(0)
+            ) @ wide.U_r.T
+        assert torch.allclose(output.float(), expected, atol=1e-5, rtol=1e-5)
+
+        restored = SparsePreconditioner(
+            p, max_precond_dim=256, k_min=4, use_int8_ema=True, factor_mode="wide"
+        )
+        restored.load_state_dict(wide.state_dict())
+        assert torch.allclose(output, restored.precondition(gradient), atol=1e-5)
+
+    def test_low_rank_curvature_mode_is_rejected(self):
+        """The supported optimizer path uses only the dense curvature EMA."""
+        from scao.preconditioner import SparsePreconditioner
+
+        parameter = torch.randn(256, 16)
+        with pytest.raises(ValueError, match="stable dense curvature"):
+            SparsePreconditioner(
+                parameter,
+                max_precond_dim=256,
+                k_min=8,
+                use_int8_ema=True,
+                factor_mode="wide",
+                curvature_mode="low_rank",
+            )
 
     def test_optimizer_with_large_layer(self):
         """SCAO optimizer step must work end-to-end on a model with large layers."""

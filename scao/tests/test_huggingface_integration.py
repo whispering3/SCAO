@@ -100,6 +100,22 @@ def test_hf_adapters_only_policy_preconditions_only_lora(monkeypatch):
     assert id(model.embed_tokens.weight) in disabled
 
 
+def test_hf_adapters_only_forwards_wide_lora_factor_mode(monkeypatch):
+    _install_transformers_stub(monkeypatch)
+    model = _TinyPeftLikeModel()
+
+    opt, _ = get_scao_optimizer(
+        model,
+        _Args(),
+        preconditioner_policy="adapters_only",
+        scao_kwargs={"factor_mode": "wide", "max_precond_dim": 128},
+        num_training_steps=10,
+    )
+
+    assert all(group["factor_mode"] == "wide" for group in opt.param_groups)
+    assert all(group["max_precond_dim"] == 128 for group in opt.param_groups)
+
+
 def test_hf_invalid_preconditioner_policy_raises(monkeypatch):
     _install_transformers_stub(monkeypatch)
     model = _TinyPeftLikeModel()

@@ -100,7 +100,13 @@ def _worker_converges(rank: int, world_size: int, init_file: str, result_queue) 
 # Worker: sync_preconditioner test
 # ---------------------------------------------------------------------------
 
-def _worker_sync(rank: int, world_size: int, init_file: str, result_queue) -> None:
+def _worker_sync(
+    rank: int,
+    world_size: int,
+    init_file: str,
+    factor_mode: str,
+    result_queue,
+) -> None:
     try:
         _init_process_group(rank, world_size, init_file)
         torch.manual_seed(0)
@@ -113,6 +119,7 @@ def _worker_sync(rank: int, world_size: int, init_file: str, result_queue) -> No
             warmup_steps=2,
             precond_freq=2,
             async_precond=False,
+            factor_mode=factor_mode,
         )
 
         # Run a few steps to build up preconditioner state.
@@ -124,23 +131,26 @@ def _worker_sync(rank: int, world_size: int, init_file: str, result_queue) -> No
             optimizer.step()
             optimizer.zero_grad()
 
-        # Inject diverged state on rank 1 by zeroing its eigenfactors.
+        # Inject diverged state on rank 1 by zeroing its active eigenfactor.
         if rank == 1:
             for state in optimizer.state.values():
                 precond = state.get("preconditioner")
                 if precond is not None and precond.use_kronecker:
-                    precond.U_l.zero_()
-                    precond.U_r.zero_()
+                    if precond._tracks_left:
+                        precond.U_l.zero_()
+                    if precond._tracks_right:
+                        precond.U_r.zero_()
 
         # sync_preconditioner broadcasts rank-0 state to rank 1.
         optimizer.sync_preconditioner()
 
-        # Both ranks collect their U_l norm and all_gather onto rank 0.
+        # Both ranks collect the active-factor norm and all_gather onto rank 0.
         found_kronecker = False
         for state in optimizer.state.values():
             precond = state.get("preconditioner")
             if precond is not None and precond.use_kronecker:
-                norm_t = torch.tensor([precond.U_l.norm().item()])
+                active = precond.U_l if precond._tracks_left else precond.U_r
+                norm_t = torch.tensor([active.norm().item()])
                 gathered = [torch.zeros(1) for _ in range(world_size)]
                 dist.all_gather(gathered, norm_t)
                 if rank == 0:
@@ -209,6 +219,42 @@ def test_ddp_converges():
     not dist.is_available(),
     reason="torch.distributed not available",
 )
+def test_sync_preconditioner_wide_factor_mode():
+    """DDP synchronisation supports one-sided rectangular LoRA state."""
+    world_size = 2
+    ctx = mp.get_context("spawn")
+    result_queue = ctx.Queue()
+
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".rendezvous") as f:
+        init_file = f.name
+
+    try:
+        procs = []
+        for rank in range(world_size):
+            p = ctx.Process(
+                target=_worker_sync,
+                args=(rank, world_size, init_file, "wide", result_queue),
+            )
+            p.start()
+            procs.append(p)
+
+        for p in procs:
+            p.join(timeout=120)
+            assert p.exitcode == 0, f"Process exited with {p.exitcode}"
+
+        _, norms, err = result_queue.get(timeout=5)
+        assert err is None, f"Error: {err}"
+        assert norms is not None
+        assert abs(norms[0] - norms[1]) < 1e-5
+
+    finally:
+        Path(init_file).unlink(missing_ok=True)
+
+
+@pytest.mark.skipif(
+    not dist.is_available(),
+    reason="torch.distributed not available",
+)
 def test_sync_preconditioner():
     """After injecting diverged state on rank 1, sync restores identical state."""
     world_size = 2
@@ -223,7 +269,7 @@ def test_sync_preconditioner():
         for rank in range(world_size):
             p = ctx.Process(
                 target=_worker_sync,
-                args=(rank, world_size, init_file, result_queue),
+                args=(rank, world_size, init_file, "full", result_queue),
             )
             p.start()
             procs.append(p)

@@ -1,7 +1,7 @@
 """
 SCAO Logging & Monitoring
 =========================
-Zero-cost callback system for observing optimizer internals during training.
+Callback system for observing optimizer internals during training.
 
 Usage
 -----

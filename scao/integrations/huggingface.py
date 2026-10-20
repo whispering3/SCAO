@@ -39,6 +39,7 @@ Path C — Trainer callback for monitoring
 
 from __future__ import annotations
 
+import warnings
 from typing import TYPE_CHECKING, Any
 
 import torch.nn as nn
@@ -93,7 +94,8 @@ def get_scao_optimizer(
             parameters for ``preconditioner_policy="adapters_only"``.
         preconditioner_policy: one of:
             ``"all"``: precondition all trainable parameters. This is the
-                backwards-compatible default.
+            backwards-compatible default. For QLoRA, use ``"adapters_only"``
+            together with ``scao_3b``-equivalent kwargs.
             ``"auto"``: precondition trainable non-embedding parameters.
             ``"none"``: disable preconditioning for all parameters.
             ``"adapters_only"``: precondition only adapter/LoRA-style params.
@@ -292,14 +294,20 @@ def _make_scao_trainer_class():
             if self.lr_scheduler is None:
                 try:
                     from transformers import get_scheduler  # type: ignore[import]
-                    self.lr_scheduler = get_scheduler(
-                        name=self.args.lr_scheduler_type,
-                        optimizer=self.optimizer,
-                        num_warmup_steps=self.args.get_warmup_steps(num_training_steps),
-                        num_training_steps=num_training_steps,
+                except ImportError:
+                    warnings.warn(
+                        "Transformers scheduler helpers are unavailable; using Trainer's scheduler.",
+                        RuntimeWarning,
+                        stacklevel=2,
                     )
-                except Exception:
                     super().create_optimizer_and_scheduler(num_training_steps)
+                    return
+                self.lr_scheduler = get_scheduler(
+                    name=self.args.lr_scheduler_type,
+                    optimizer=self.optimizer,
+                    num_warmup_steps=self.args.get_warmup_steps(num_training_steps),
+                    num_training_steps=num_training_steps,
+                )
 
     return SCAOTrainer
 

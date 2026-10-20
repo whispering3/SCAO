@@ -49,17 +49,14 @@ def scao_sub1b(model_or_params: Any, lr: float = 5e-4, **kw: Any) -> SCAO:
             k_max=64,
             max_precond_dim=1024,
             epsilon_sparse=0.10,
-            sparsity=0.4,
-            dynamic_sparsity=True,
-            adaptive_warmup=True,
-            warmup_stability_threshold=0.08,
-            warmup_patience=3,
+            sparsity=0.0,
+            dynamic_sparsity=False,
+            adaptive_warmup=False,
             lazy_precond=False,
             use_gsnr_clip=False,
             adaptive_rank=False,
-            noise_std_init=0.005,
-            noise_anneal=0.995,
-            lars_coeff=5e-4,
+            noise_std_init=0.0,
+            lars_coeff=0.0,
             lookahead_k=0,
             beta3=0.98,
             tau=0.8,
@@ -84,19 +81,15 @@ def scao_1b(model_or_params: Any, lr: float = 3e-4, **kw: Any) -> SCAO:
             k_max=96,
             max_precond_dim=2048,
             epsilon_sparse=0.07,
-            sparsity=0.50,
-            dynamic_sparsity=True,
-            adaptive_warmup=True,
-            warmup_stability_threshold=0.06,
-            warmup_patience=4,
+            sparsity=0.0,
+            dynamic_sparsity=False,
+            adaptive_warmup=False,
             lazy_precond=False,
             use_gsnr_clip=False,
             adaptive_rank=False,
-            noise_std_init=0.008,
-            noise_anneal=0.997,
-            lars_coeff=8e-4,
-            lookahead_k=3,
-            lookahead_alpha=0.4,
+            noise_std_init=0.0,
+            lars_coeff=0.0,
+            lookahead_k=0,
             beta3=0.985,
             tau=0.9,
         ),
@@ -104,23 +97,66 @@ def scao_1b(model_or_params: Any, lr: float = 3e-4, **kw: Any) -> SCAO:
 
 
 def scao_3b(model_or_params: Any, lr: float = 2e-4, **kw: Any) -> SCAO:
-    """3B params. T4/A10 16–24 GB, QLoRA."""
+    """3B params. Memory-bounded QLoRA profile for T4/A10 GPUs.
+
+    LoRA matrices have one wide side and one rank-r side.  Limiting dense
+    curvature blocks to 256 avoids retaining full hidden_size² EMAs for every
+    adapter while preserving block-local preconditioning on the wide side.
+    """
     from .optimizer import SCAO
 
     return SCAO(
         _params_from_model_or_iterable(model_or_params), lr=lr,
         **_merge_preset_defaults(
             kw,
-            warmup_steps=50,
+            warmup_steps=20,
             blend_steps=30,
             precond_freq=10,
-            dynamic_sparsity=True,
-            adaptive_warmup=True,
-            warmup_patience=3,
+            min_precond_updates=2,
+            max_precond_dim=256,
+            use_int8_ema=True,
+            factor_mode="wide",
+            dynamic_sparsity=False,
+            adaptive_warmup=False,
             lazy_precond=False,
             use_gsnr_clip=False,
             adaptive_rank=False,
-            sparsity=0.6,
+            sparsity=0.0,
+            noise_std_init=0.0,
+            lars_coeff=0.0,
+            lookahead_k=0,
+        ),
+    )
+
+
+def scao_3b_low_memory(model_or_params: Any, lr: float = 2e-4, **kw: Any) -> SCAO:
+    """3B QLoRA profile prioritising optimizer-state memory over curvature detail.
+
+    This profile halves the wide curvature-block size relative to ``scao_3b``.
+    Compare it against an AdamW baseline on the target workload before use.
+    """
+    from .optimizer import SCAO
+
+    return SCAO(
+        _params_from_model_or_iterable(model_or_params), lr=lr,
+        **_merge_preset_defaults(
+            kw,
+            warmup_steps=20,
+            blend_steps=30,
+            precond_freq=20,
+            min_precond_updates=2,
+            max_precond_dim=128,
+            use_int8_ema=True,
+            factor_mode="wide",
+            dynamic_sparsity=False,
+            adaptive_warmup=False,
+            lazy_precond=False,
+            use_gsnr_clip=False,
+            adaptive_rank=False,
+            sparsity=0.0,
+            noise_std_init=0.0,
+            lars_coeff=0.0,
+            lookahead_k=0,
         ),
     )
 
@@ -135,13 +171,15 @@ def scao_7b(model_or_params: Any, lr: float = 1e-4, **kw: Any) -> SCAO:
             kw,
             warmup_steps=80,
             precond_freq=15,
-            dynamic_sparsity=True,
-            adaptive_warmup=True,
+            dynamic_sparsity=False,
+            adaptive_warmup=False,
             lazy_precond=False,
-            use_gsnr_clip=True,
-            gsnr_threshold=0.4,
-            adaptive_rank=True,
-            sparsity=0.65,
+            use_gsnr_clip=False,
+            adaptive_rank=False,
+            sparsity=0.0,
+            noise_std_init=0.0,
+            lars_coeff=0.0,
+            lookahead_k=0,
         ),
     )
 
@@ -160,16 +198,15 @@ def scao_40b(model_or_params: Any, lr: float = 5e-5, **kw: Any) -> SCAO:
             k_min=4,
             k_max=64,
             max_precond_dim=2048,
-            dynamic_sparsity=True,
-            adaptive_warmup=True,
-            lazy_precond=True,
-            lazy_delta_threshold=0.08,
-            lazy_max_skip=40,
-            use_gsnr_clip=True,
-            gsnr_threshold=0.5,
-            adaptive_rank=True,
+            dynamic_sparsity=False,
+            adaptive_warmup=False,
+            lazy_precond=False,
+            use_gsnr_clip=False,
+            adaptive_rank=False,
             use_int8_ema=True,
-            sparsity=0.75,
+            sparsity=0.0,
+            noise_std_init=0.0,
+            lars_coeff=0.0,
             lookahead_k=0,
         ),
     )
@@ -188,16 +225,15 @@ def scao_125b(model_or_params: Any, lr: float = 2e-5, **kw: Any) -> SCAO:
             k_min=4,
             k_max=32,
             max_precond_dim=1024,
-            dynamic_sparsity=True,
-            adaptive_warmup=True,
-            lazy_precond=True,
-            lazy_delta_threshold=0.05,
-            lazy_max_skip=60,
-            use_gsnr_clip=True,
-            gsnr_threshold=0.6,
-            adaptive_rank=True,
+            dynamic_sparsity=False,
+            adaptive_warmup=False,
+            lazy_precond=False,
+            use_gsnr_clip=False,
+            adaptive_rank=False,
             use_int8_ema=True,
-            sparsity=0.80,
+            sparsity=0.0,
+            noise_std_init=0.0,
+            lars_coeff=0.0,
             lookahead_k=0,
             async_precond=True,
         ),

@@ -10,7 +10,7 @@ To compile the CUDA extension:
     python setup.py build_ext --inplace
 
 Or install from the project root:
-    pip install -e ".[cuda]"
+    scao-build-cuda
 
 Public API
 ----------
@@ -19,8 +19,7 @@ fused_kronecker_precond(U_l, s_l_inv4, U_r, s_r_inv4, G) -> Tensor
         P     = U_l^T @ G @ U_r          (k×k)
         delta = (s_l_inv4[:,None] * s_r_inv4[None,:] - 1) * P
         out   = G + U_l @ delta @ U_r^T
-    Uses the fused CUDA kernel when k <= 32 and all tensors are on CUDA.
-    Falls back to pure PyTorch otherwise.
+    Uses the supported PyTorch implementation.
 
 low_rank_precond_mm(U, s, G, left=True) -> Tensor
     Efficient U diag(s) U^T @ G  (left=True) or G @ U diag(s) U^T (left=False).
@@ -142,10 +141,10 @@ def _low_rank_precond_mm_pytorch(
 
 def _int8_ema_update_pytorch(
     ema_q: Tensor,
-    ema_scale: float,
+    ema_scale: float | Tensor,
     new_val: Tensor,
     rho: float,
-) -> tuple[Tensor, float]:
+) -> tuple[Tensor, Tensor]:
     """
     Pure-PyTorch int8 EMA update.
 
@@ -156,10 +155,15 @@ def _int8_ema_update_pytorch(
     """
     fp32 = ema_q.to(torch.float32).mul_(ema_scale)
     updated = fp32.mul_(rho).add_(new_val)
-    abs_max = updated.abs().max().item()
-    new_scale = abs_max / 127.0 if abs_max > 1e-30 else 1.0
-    inv_scale = 1.0 / new_scale if new_scale > 1e-30 else 0.0
-    q_new = updated.mul_(inv_scale).round_().clamp_(-127, 127).to(torch.int8)
+    # Keep the scale on the device. Calling ``.item()`` here forces a
+    # host-side CUDA synchronization for every curvature block.
+    abs_max = updated.abs().amax()
+    new_scale = torch.where(
+        abs_max > 1e-30,
+        abs_max / 127.0,
+        torch.ones_like(abs_max),
+    )
+    q_new = updated.div_(new_scale).round_().clamp_(-127, 127).to(torch.int8)
     return q_new, new_scale
 
 
@@ -178,10 +182,8 @@ def fused_kronecker_precond(
     Apply fused Kronecker identity+correction preconditioner to gradient G.
 
     Routing:
-      - CUDA extension available AND k <= 32 AND all tensors on CUDA
-        → ``_scao_cuda.fused_kronecker_precond`` (kernel 3)
-      - Otherwise
-        → pure-PyTorch fallback
+      - supported path
+        → pure-PyTorch implementation
 
     Args:
         U_l:      (m, k) left eigenvectors, float32
@@ -193,19 +195,9 @@ def fused_kronecker_precond(
     Returns:
         Preconditioned gradient, same shape and dtype as G.
     """
-    ext = _load_ext()
-    k = U_l.shape[1]
-    use_cuda_kernel = (
-        ext is not None
-        and G.is_cuda
-        and k <= 32
-    )
-    if use_cuda_kernel:
-        assert ext is not None
-        try:
-            return ext.fused_kronecker_precond(U_l, s_l_inv4, U_r, s_r_inv4, G)
-        except (AttributeError, RuntimeError):
-            pass
+    # The custom fused Kronecker kernel is deliberately not part of the
+    # supported execution path. Preserve one well-tested implementation for
+    # reproducible training and benchmark comparisons.
     return _fused_kronecker_precond_pytorch(U_l, s_l_inv4, U_r, s_r_inv4, G)
 
 
@@ -253,10 +245,10 @@ def low_rank_precond_mm(
 
 def int8_ema_update(
     ema_q: Tensor,
-    ema_scale: float,
+    ema_scale: float | Tensor,
     new_val: Tensor,
     rho: float,
-) -> tuple[Tensor, float]:
+) -> tuple[Tensor, float | Tensor]:
     """
     Fused int8 EMA update: dequantize → rho*old + new_val → requantize.
 
@@ -275,6 +267,12 @@ def int8_ema_update(
     Returns:
         (q_new, new_scale): updated int8 EMA tensor and new scale factor
     """
+    # A tensor scale comes from the synchronization-free PyTorch fallback.
+    # Keep that path on-device rather than converting it back to a Python
+    # float solely to call an optional extension.
+    if isinstance(ema_scale, Tensor):
+        return _int8_ema_update_pytorch(ema_q, ema_scale, new_val, rho)
+
     ext = _load_ext()
     use_cuda_kernel = (
         ext is not None
@@ -284,17 +282,9 @@ def int8_ema_update(
     if use_cuda_kernel:
         assert ext is not None
         try:
-            return ext.int8_ema_update(ema_q, ema_scale, new_val, rho)
+            q_new, new_scale = ext.int8_ema_update(ema_q, ema_scale, new_val, rho)
+            return q_new.reshape_as(ema_q), new_scale
         except (AttributeError, RuntimeError):
-            pass
-
-    if ema_q.is_cuda:
-        try:
-            from .triton_ops import int8_ema_update_triton
-            res = int8_ema_update_triton(ema_q, ema_scale, new_val, rho)
-            if res is not None:
-                return res
-        except Exception:
             pass
 
     return _int8_ema_update_pytorch(ema_q, ema_scale, new_val, rho)

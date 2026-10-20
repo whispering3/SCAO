@@ -5,6 +5,64 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.2.4] — Unreleased
+
+### Fixed
+- **Fair QLoRA comparisons**: the 3B benchmark now runs AdamW and SCAO with
+  the same LR, scheduler, seed, data, and update count, and reports when
+  SCAO's preconditioner actually activates.
+- **Safe default behavior**: disabled absolute gradient noise, sparsity, LARS,
+  and lookahead by default; these features are opt-in pending workload-specific
+  ablations.
+- **QLoRA memory profile**: `scao_3b()` now uses int8 EMAs and 256-wide
+  curvature blocks, avoiding full hidden-size squared curvature state per LoRA
+  adapter.
+- **Low-memory QLoRA profile**: added `scao_3b_low_memory()` with 128-wide
+  blocks and less frequent curvature updates for memory-constrained GPUs.
+- **One-sided LoRA curvature**: `factor_mode="wide"` retains curvature only
+  for the wide side of rectangular LoRA matrices. The 3B QLoRA presets use it;
+  the full two-sided mode remains the base optimizer default.
+- **Wide-factor application path**: one-sided LoRA updates now cache their
+  spectral correction between curvature refreshes and use `addmm` for the
+  final low-rank update, reducing per-step temporary allocations while
+  preserving the same preconditioned gradient.
+- **Benchmark EMA ablation**: the QLoRA benchmark can now compare int8 and
+  FP32 curvature EMA storage without overwriting records, making the
+  throughput-versus-memory trade-off reproducible.
+- **Stable dataset provenance**: QLoRA dataset fingerprints no longer change
+  when an unrelated optimizer option changes between benchmark invocations.
+- **AdamW update rule**: SCAO now applies its preconditioned gradient through
+  AdamW moments, removing the two full-size Adan buffers from optimizer state.
+  The supported path now uses AdamW moments exclusively.
+- **Supported curvature path**: the public optimizer and benchmark use dense
+  curvature EMA only. Experimental covariance-sketch settings are rejected so
+  production runs cannot select an unvalidated algorithm.
+- **Reproducible benchmark records**: the QLoRA benchmark now saves per-run
+  JSON with effective settings, environment metadata, dataset fingerprints,
+  measurements, model revision, and a SCAO source fingerprint for ZIP-based
+  executions without a Git checkout.
+- **Hugging Face readiness suite**: benchmark controls now cover model scale,
+  LoRA configuration, sequence length, and full versus wide factors. A paired
+  JSON report generator and an H100 protocol are included for review evidence.
+- **Trainer error handling**: scheduler construction now surfaces unexpected
+  Transformers errors instead of silently replacing the configured optimizer.
+- **Int8 update routing**: the curvature EMA update uses the optional compiled
+  CUDA extension when available and otherwise retains a tested PyTorch
+  fallback. Added the explicit `scao-build-cuda` build command.
+- **PyTorch int8 fallback**: kept the quantization scale on the device during
+  curvature refreshes, avoiding a host synchronization for each curvature
+  block when the optional extension is unavailable.
+- **Gradient consistency**: curvature and preconditioned updates now consume
+  the same filtered/noised gradient.
+- **Scale-aware noise**: optional `noise_relative=True` scales injected noise
+  by effective-gradient RMS, avoiding a fixed noise magnitude that can dominate
+  small LoRA gradients.
+- **Dataset compatibility**: benchmark and example scripts now use the
+  maintained `Salesforce/wikitext` dataset identifier instead of the legacy
+  un-namespaced alias rejected by current Hugging Face clients.
+
+---
+
 ## [0.2.3] — 2026-10-04
 
 ### Added
@@ -14,7 +72,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **Python 3.13 Support**: Added Python 3.13 to CI test matrix.
 
 ### Changed
-- **Modular Core Architecture**: Refactored `scao/optimizer.py` into focused, reusable modules while preserving 100% backward compatibility:
+- **Modular Core Architecture**: Refactored `scao/optimizer.py` into focused, reusable modules while retaining compatibility with supported optimizer state.
   - `scao/filters.py`: Gradient filters (`_SparseGradFilter`, `_DynamicSparseFilter`), adaptive warmup, gSNR element-wise clipping, and lazy triggers.
   - `scao/presets.py`: Model scale presets (`scao_sub1b` through `scao_125b`).
   - `scao/optimizer.py`: Lean optimizer step loop and state management.
@@ -32,7 +90,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **gSNR Clipping (R4)**: Element-wise signal-to-noise ratio masks applied before updates to stabilize Foundation Model training.
 - **Adaptive Rank (R5)**: Dynamic `k` selection proportional to layer activity and spectral mass.
 - **Scale Presets**: New optimized configurations: `scao_3b`, `scao_7b`, `scao_40b`, and `scao_125b`.
-- **Int8 EMA (Stable)**: Production-ready 4x reduction in curvature buffer memory with zero convergence loss.
+- **Int8 EMA**: Curvature EMA representation that reduces stored-buffer memory by approximately 4x; evaluate numerical impact for each workload.
 - **Asynchronous Preconditioning**: Background CUDA compute for factor updates to hide second-order overhead.
 
 ### Fixed

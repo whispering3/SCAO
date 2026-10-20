@@ -85,6 +85,7 @@ secrets.yml
 SCAO_Technical_Paper.docx
 
 # Generated artifacts — not part of the package
+artifacts/
 SCAO_Enterprise_Spec.docx
 scao_upload.zip
 scao_project_upload.zip
@@ -99,3 +100,4 @@ scao-*/
 examples/resultado_scao_1m/
 # Local benchmarks
 scao_benchmarks_t4/
+scao_benchmark_4b_results/

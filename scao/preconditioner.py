@@ -52,13 +52,19 @@ v3 patch:
 
 from __future__ import annotations
 
+import math
 import warnings
 from typing import cast
 
 import torch
 from torch import Tensor
 
-from .cuda import fused_kronecker_precond as _cuda_fused_precond
+from .cuda import (
+    fused_kronecker_precond as _cuda_fused_precond,
+)
+from .cuda import (
+    int8_ema_update as _cuda_int8_ema_update,
+)
 from .utils import (
     adaptive_rank,
     dequantize_sym_int8,
@@ -107,6 +113,9 @@ class SparsePreconditioner:
         max_precond_dim: int = 4096,
         use_newton_schulz: bool = False,
         use_int8_ema: bool = False,
+        factor_mode: str = "full",
+        curvature_mode: str = "dense",
+        curvature_rank: int | None = None,
     ) -> None:
         shape = param.shape
         device = param.device
@@ -120,11 +129,28 @@ class SparsePreconditioner:
         self.m = m
         self.n = n
         self.epsilon_sparse = epsilon_sparse
+        if factor_mode not in {"full", "wide"}:
+            raise ValueError("factor_mode must be 'full' or 'wide'")
+        if curvature_mode != "dense" or curvature_rank is not None:
+            raise ValueError(
+                "Only the stable dense curvature path is supported; "
+                "use curvature_mode='dense' and curvature_rank=None"
+            )
+        self.factor_mode = factor_mode
+        self.curvature_mode = curvature_mode
+        # ``wide`` is intended for rectangular LoRA adapters. For a square
+        # matrix there is no rank-r side to omit, so retain the full factor.
+        self._tracks_left = factor_mode == "full" or m >= n
+        self._tracks_right = factor_mode == "full" or n >= m
 
         # Clamp k_min/k_max to matrix dimensions to avoid invalid ranks in small layers
         d_min = min(m, n)
         self.k_min = min(k_min, d_min)
         self.k_max = min(k_max, d_min // 2) if d_min > 2 * self.k_min else self.k_min
+        # A low-rank sketch keeps a small covariance subspace. Keeping twice
+        # the active-factor budget preserves room for new gradient directions
+        # without reintroducing a dense d x d EMA.
+        self.curvature_rank = curvature_rank or max(2 * self.k_max, self.k_min)
 
         self.rho = rho
         # use_int8_ema: store L_ema/R_ema as int8 tensors with float32 scale factors.
@@ -190,6 +216,9 @@ class SparsePreconditioner:
                     max_precond_dim=max_precond_dim,
                     use_newton_schulz=use_newton_schulz,
                     use_int8_ema=use_int8_ema,
+                    factor_mode=factor_mode,
+                    curvature_mode=curvature_mode,
+                    curvature_rank=curvature_rank,
                 )
                 self._blocks.append(blk)
             # _k tracks the average rank across blocks.
@@ -215,18 +244,38 @@ class SparsePreconditioner:
             # starting point: eigenvalues begin near 1e-4, S^{-1/4} ≈ 10,
             # which is safely handled by the adaptive-eps regularization.
             _eye_eps = 1e-4
-            L_init = torch.eye(m, device=device, dtype=_PRECOND_DTYPE) * _eye_eps
-            R_init = torch.eye(n, device=device, dtype=_PRECOND_DTYPE) * _eye_eps
+            if curvature_mode == "low_rank":
+                # Low-rank covariance sketch B where B @ B.T approximates the
+                # EMA. It is intentionally float32: the sketch is already far
+                # smaller than the dense int8 representation and is updated by
+                # a numerically sensitive thin SVD.
+                if self._tracks_left:
+                    self.L_sketch = torch.zeros(
+                        m, min(m, self.curvature_rank), device=device, dtype=_PRECOND_DTYPE
+                    )
+                if self._tracks_right:
+                    self.R_sketch = torch.zeros(
+                        n, min(n, self.curvature_rank), device=device, dtype=_PRECOND_DTYPE
+                    )
+            else:
+                L_init = torch.eye(m, device=device, dtype=_PRECOND_DTYPE) * _eye_eps
+                R_init = torch.eye(n, device=device, dtype=_PRECOND_DTYPE) * _eye_eps
 
-            if use_int8_ema:
+            if curvature_mode == "dense" and use_int8_ema:
                 # Store EMA as int8 + float scale for 4× memory reduction.
                 # (m²+n²) bytes int8 vs (m²+n²)*4 bytes fp32.
-                self.L_ema_q, self.L_ema_scale = quantize_sym_int8(L_init)
-                self.R_ema_q, self.R_ema_scale = quantize_sym_int8(R_init)
+                if self._tracks_left:
+                    self.L_ema_scale: float | Tensor
+                    self.L_ema_q, self.L_ema_scale = quantize_sym_int8(L_init)
+                if self._tracks_right:
+                    self.R_ema_scale: float | Tensor
+                    self.R_ema_q, self.R_ema_scale = quantize_sym_int8(R_init)
                 # float32 shadow used only during eigendecomposition — not stored between steps
-            else:
-                self.L_ema = L_init
-                self.R_ema = R_init
+            elif curvature_mode == "dense":
+                if self._tracks_left:
+                    self.L_ema = L_init
+                if self._tracks_right:
+                    self.R_ema = R_init
 
             self.U_l = torch.eye(m, k_init, device=device, dtype=_PRECOND_DTYPE)
             self.S_l = torch.ones(k_init, device=device, dtype=_PRECOND_DTYPE)
@@ -250,6 +299,11 @@ class SparsePreconditioner:
         self.S_r_inv4 = self.S_r.clamp(min=eps).pow(-0.25)
         self.S_l_inv2 = self.S_l.clamp(min=eps).pow(-0.5)
         self.S_r_inv2 = self.S_r.clamp(min=eps).pow(-0.5)
+        # In wide-only mode this avoids forming ``S_inv4 - 1`` for every
+        # adapter and every optimizer step.  These tensors are refreshed only
+        # when the eigensystem changes.
+        self.S_l_correction = self.S_l_inv4 - 1.0
+        self.S_r_correction = self.S_r_inv4 - 1.0
 
     # ------------------------------------------------------------------
     # R5: k property — safe external rank assignment
@@ -353,18 +407,35 @@ class SparsePreconditioner:
             return
 
         alpha = 1.0 - self.rho
-        if self.use_int8_ema:
-            # int8 path: dequantize → update → requantize
-            L_fp32 = dequantize_sym_int8(self.L_ema_q, self.L_ema_scale)
-            L_new  = L_fp32.mul_(self.rho).add_(alpha * (g2d_f32 @ g2d_f32.T))
-            self.L_ema_q, self.L_ema_scale = quantize_sym_int8(L_new)
-
-            R_fp32 = dequantize_sym_int8(self.R_ema_q, self.R_ema_scale)
-            R_new  = R_fp32.mul_(self.rho).add_(alpha * (g2d_f32.T @ g2d_f32))
-            self.R_ema_q, self.R_ema_scale = quantize_sym_int8(R_new)
+        low_rank_left: tuple[Tensor, Tensor] | None = None
+        low_rank_right: tuple[Tensor, Tensor] | None = None
+        if self.curvature_mode == "low_rank":
+            if self._tracks_left:
+                self.L_sketch, low_rank_left = self._update_low_rank_sketch(
+                    self.L_sketch, g2d_f32, alpha, left=True
+                )
+            if self._tracks_right:
+                self.R_sketch, low_rank_right = self._update_low_rank_sketch(
+                    self.R_sketch, g2d_f32, alpha, left=False
+                )
+        elif self.use_int8_ema:
+            # Route through the CUDA/Triton helper when it is available. The
+            # fallback is numerically equivalent to the explicit PyTorch path.
+            if self._tracks_left:
+                l_update = alpha * (g2d_f32 @ g2d_f32.T)
+                self.L_ema_q, self.L_ema_scale = _cuda_int8_ema_update(
+                    self.L_ema_q, self.L_ema_scale, l_update, self.rho
+                )
+            if self._tracks_right:
+                r_update = alpha * (g2d_f32.T @ g2d_f32)
+                self.R_ema_q, self.R_ema_scale = _cuda_int8_ema_update(
+                    self.R_ema_q, self.R_ema_scale, r_update, self.rho
+                )
         else:
-            self.L_ema.mul_(self.rho).add_(alpha * (g2d_f32 @ g2d_f32.T))
-            self.R_ema.mul_(self.rho).add_(alpha * (g2d_f32.T @ g2d_f32))
+            if self._tracks_left:
+                self.L_ema.mul_(self.rho).add_(alpha * (g2d_f32 @ g2d_f32.T))
+            if self._tracks_right:
+                self.R_ema.mul_(self.rho).add_(alpha * (g2d_f32.T @ g2d_f32))
 
         # EMA bias correction: the EMA starts at 0 so early estimates are
         # (1-rho^t) * true_value instead of true_value. Divide by (1-rho^t)
@@ -372,11 +443,40 @@ class SparsePreconditioner:
         # Without this, S_l eigenvalues are ~0 for the first ~1/(1-rho) steps,
         # making S_l^{-1/4} blow up and the preconditioned gradient useless.
         bias_factor = 1.0 - self.rho ** self.precond_step
-        self._update_eigenfactors(bias_factor)
+        self._update_eigenfactors(bias_factor, low_rank_left, low_rank_right)
+
+    def _update_low_rank_sketch(
+        self,
+        sketch: Tensor,
+        gradient: Tensor,
+        alpha: float,
+        *,
+        left: bool,
+    ) -> tuple[Tensor, tuple[Tensor, Tensor]]:
+        """Update a decayed covariance sketch and return its eigensystem.
+
+        If ``B @ B.T`` approximates the prior covariance, concatenating
+        ``sqrt(rho) * B`` with ``sqrt(alpha) * G`` represents the next EMA
+        before truncation. A thin SVD keeps only ``curvature_rank`` columns.
+        This turns dense covariance storage and eigendecomposition into a
+        bounded low-rank update suitable for rectangular LoRA matrices.
+        """
+        sample = gradient if left else gradient.T
+        candidate = torch.cat((sketch * math.sqrt(self.rho), sample * math.sqrt(alpha)), dim=1)
+        vectors, singular_values, _ = torch.linalg.svd(candidate, full_matrices=False)
+        width = sketch.shape[1]
+        vectors = vectors[:, :width].contiguous()
+        singular_values = singular_values[:width].contiguous()
+        return vectors * singular_values.unsqueeze(0), (singular_values.square(), vectors)
 
     @torch.no_grad()
     @torch.compiler.disable
-    def _update_eigenfactors(self, bias_factor: float = 1.0) -> None:
+    def _update_eigenfactors(
+        self,
+        bias_factor: float = 1.0,
+        low_rank_left: tuple[Tensor, Tensor] | None = None,
+        low_rank_right: tuple[Tensor, Tensor] | None = None,
+    ) -> None:
         """
         Eigendecompose L_ema and R_ema, select adaptive rank, store U/S factors.
 
@@ -393,61 +493,63 @@ class SparsePreconditioner:
         because U/S tensors are being replaced in full — no truncation needed.
         """
         eps = 1e-8
-        # Dequantize if int8 EMA is active
-        if self.use_int8_ema:
-            L_fp32 = dequantize_sym_int8(self.L_ema_q, self.L_ema_scale)
-            R_fp32 = dequantize_sym_int8(self.R_ema_q, self.R_ema_scale)
-        else:
-            L_fp32 = self.L_ema
-            R_fp32 = self.R_ema
+        def eig_factor(ema: Tensor, dim: int) -> tuple[Tensor, Tensor]:
+            debiased = ema / max(bias_factor, eps)
+            regularizer = max(eps, 1e-4 * debiased.trace().item() / dim)
+            matrix = debiased.clone()
+            matrix.diagonal().add_(regularizer)
+            try:
+                spectrum, vectors = torch.linalg.eigh(matrix)
+            except torch.linalg.LinAlgError:
+                matrix.diagonal().add_(eps)
+                spectrum, vectors = torch.linalg.eigh(matrix)
+            return spectrum.flip(0).clamp(min=0.0), vectors.flip(1)
 
-        # Apply bias correction so eigenvalues reflect true curvature scale
-        L_debiased = L_fp32 / max(bias_factor, eps)
-        R_debiased = R_fp32 / max(bias_factor, eps)
-
-        # Adaptive Tikhonov regularization before inversion.
-        # eps_precond = 1e-4 * trace(L) / m ensures the matrix is always
-        # well-conditioned relative to the current curvature scale.  This
-        # prevents blow-up of S^{-1/4} in low-signal directions and is
-        # more robust than a fixed eps across different model sizes/dtypes.
-        # Use clone() + diagonal().add_() to avoid allocating a full m×m or n×n
-        # identity matrix — significantly cheaper for large preconditioner dims.
-        eps_l = max(eps, 1e-4 * L_debiased.trace().item() / self.m)
-        eps_r = max(eps, 1e-4 * R_debiased.trace().item() / self.n)
-        L_reg = L_debiased.clone()
-        L_reg.diagonal().add_(eps_l)
-        R_reg = R_debiased.clone()
-        R_reg.diagonal().add_(eps_r)
+        def sketch_factor(
+            factor: tuple[Tensor, Tensor], dim: int
+        ) -> tuple[Tensor, Tensor]:
+            spectrum, vectors = factor
+            spectrum = spectrum / max(bias_factor, eps)
+            regularizer = max(eps, 1e-4 * spectrum.sum().item() / dim)
+            return spectrum.add(regularizer), vectors
 
         # Preserve CPU RNG state so preconditioner updates do not perturb
-        # the data-loading shuffle order — important for fair benchmark comparisons.
+        # the data-loading shuffle order — important for fair comparisons.
         rng_state = torch.get_rng_state()
+        if self.curvature_mode == "low_rank":
+            left_factor = (
+                sketch_factor(low_rank_left, self.m) if low_rank_left is not None else None
+            )
+            right_factor = (
+                sketch_factor(low_rank_right, self.n) if low_rank_right is not None else None
+            )
+        elif self.use_int8_ema:
+            l_ema = (
+                dequantize_sym_int8(self.L_ema_q, self.L_ema_scale)
+                if self._tracks_left else None
+            )
+            r_ema = (
+                dequantize_sym_int8(self.R_ema_q, self.R_ema_scale)
+                if self._tracks_right else None
+            )
+        else:
+            l_ema = self.L_ema if self._tracks_left else None
+            r_ema = self.R_ema if self._tracks_right else None
 
-        # --- Left factor ---
-        try:
-            S_l_full, U_l_full = torch.linalg.eigh(L_reg)
-        except torch.linalg.LinAlgError:
-            L_reg.diagonal().add_(eps)
-            S_l_full, U_l_full = torch.linalg.eigh(L_reg)
-        S_l_full = S_l_full.flip(0).clamp(min=0.0)
-        U_l_full = U_l_full.flip(1)
-
-        # --- Right factor ---
-        try:
-            S_r_full, U_r_full = torch.linalg.eigh(R_reg)
-        except torch.linalg.LinAlgError:
-            R_reg.diagonal().add_(eps)
-            S_r_full, U_r_full = torch.linalg.eigh(R_reg)
-        S_r_full = S_r_full.flip(0).clamp(min=0.0)
-        U_r_full = U_r_full.flip(1)
-
-        # Restore CPU RNG state.
+        if self.curvature_mode != "low_rank":
+            left_factor = eig_factor(l_ema, self.m) if l_ema is not None else None
+            right_factor = eig_factor(r_ema, self.n) if r_ema is not None else None
         torch.set_rng_state(rng_state)
 
-        # --- Adaptive rank selection ---
-        k_l = adaptive_rank(S_l_full, self.epsilon_sparse, self.k_min, self.k_max)
-        k_r = adaptive_rank(S_r_full, self.epsilon_sparse, self.k_min, self.k_max)
-        # Take the smaller of the two to keep Kronecker structure symmetric
+        # In wide-only mode, select rank from the only tracked factor.
+        k_l = (
+            adaptive_rank(left_factor[0], self.epsilon_sparse, self.k_min, self.k_max)
+            if left_factor is not None else self.k_max
+        )
+        k_r = (
+            adaptive_rank(right_factor[0], self.epsilon_sparse, self.k_min, self.k_max)
+            if right_factor is not None else self.k_max
+        )
         k_new = min(k_l, k_r)
         # Apply momentum on rank change: avoid oscillating between ranks
         k_new = max(k_new, self._k - 1)   # allow rank to drop by at most 1 per update
@@ -458,11 +560,18 @@ class SparsePreconditioner:
         # so the property setter's truncation logic is not needed here.
         self._k = k_new
 
-        # Store truncated eigenfactors
-        self.U_l = U_l_full[:, :k_new].contiguous()
-        self.S_l = S_l_full[:k_new].contiguous()
-        self.U_r = U_r_full[:, :k_new].contiguous()
-        self.S_r = S_r_full[:k_new].contiguous()
+        # Store tracked factors and identity factors for the untracked side.
+        # Keeping the latter avoids special shapes in state/checkpoint logic.
+        if left_factor is not None:
+            self.S_l, self.U_l = left_factor[0][:k_new].contiguous(), left_factor[1][:, :k_new].contiguous()
+        else:
+            self.U_l = torch.eye(self.m, k_new, device=self.device, dtype=_PRECOND_DTYPE)
+            self.S_l = torch.ones(k_new, device=self.device, dtype=_PRECOND_DTYPE)
+        if right_factor is not None:
+            self.S_r, self.U_r = right_factor[0][:k_new].contiguous(), right_factor[1][:, :k_new].contiguous()
+        else:
+            self.U_r = torch.eye(self.n, k_new, device=self.device, dtype=_PRECOND_DTYPE)
+            self.S_r = torch.ones(k_new, device=self.device, dtype=_PRECOND_DTYPE)
         self._refresh_inverse_spectrum_cache()
 
     # ------------------------------------------------------------------
@@ -524,10 +633,22 @@ class SparsePreconditioner:
             result = g2d / denom
             return from_2d(result, orig_shape).to(orig_dtype)
 
-        # Use fused CUDA kernel when available (k <= 32) — avoids materialising
-        # the (m,n) correction tensor and reduces memory bandwidth.
-        # Falls back to pure PyTorch (inside _cuda_fused_precond) otherwise.
-        G_precond = _cuda_fused_precond(self.U_l, self.S_l_inv4, self.U_r, self.S_r_inv4, g2d)
+        if self._tracks_left and self._tracks_right:
+            G_precond = _cuda_fused_precond(
+                self.U_l, self.S_l_inv4, self.U_r, self.S_r_inv4, g2d
+            )
+        elif self._tracks_left:
+            # One-sided LoRA preconditioning:
+            #   G + U @ ((S^-1/4 - I) * (U.T @ G))
+            # ``addmm`` dispatches the final operation to cuBLAS and avoids
+            # materialising a separate correction tensor before addition.
+            projected = self.U_l.T @ g2d
+            projected.mul_(self.S_l_correction.unsqueeze(1))
+            G_precond = torch.addmm(g2d, self.U_l, projected)
+        else:
+            projected = g2d @ self.U_r
+            projected.mul_(self.S_r_correction.unsqueeze(0))
+            G_precond = torch.addmm(g2d, projected, self.U_r.T)
 
         return from_2d(G_precond, orig_shape).to(orig_dtype)
 
@@ -567,8 +688,15 @@ class SparsePreconditioner:
             denom = (self.diag_ema / bias).reshape_as(g2d).pow(0.5).add_(eps)
             return (g2d.pow(2) / denom).sum().sqrt()
 
-        G_proj = (self.U_l.T @ g2d) @ self.U_r   # (k, k)
-        G_scaled = self.S_l_inv2.unsqueeze(1) * G_proj * self.S_r_inv2.unsqueeze(0)
+        if self._tracks_left and self._tracks_right:
+            G_proj = (self.U_l.T @ g2d) @ self.U_r
+            G_scaled = self.S_l_inv2.unsqueeze(1) * G_proj * self.S_r_inv2.unsqueeze(0)
+        elif self._tracks_left:
+            G_proj = self.U_l.T @ g2d
+            G_scaled = self.S_l_inv2.unsqueeze(1) * G_proj
+        else:
+            G_proj = g2d @ self.U_r
+            G_scaled = G_proj * self.S_r_inv2.unsqueeze(0)
 
         return cast(Tensor, G_scaled.norm(p="fro"))
 
@@ -582,22 +710,28 @@ class SparsePreconditioner:
             "k": self._k,  # use _k directly to avoid setter side-effects
             "use_kronecker": self.use_kronecker,
             "use_block_diagonal": self.use_block_diagonal,
+            "factor_mode": self.factor_mode,
+            "curvature_mode": self.curvature_mode,
+            "curvature_rank": self.curvature_rank,
         }
         if self.use_block_diagonal:
             d["blocks"] = [blk.state_dict() for blk in self._blocks]
         elif self.use_kronecker:
-            if self.use_int8_ema:
-                d.update({
-                    "L_ema_q": self.L_ema_q,
-                    "L_ema_scale": self.L_ema_scale,
-                    "R_ema_q": self.R_ema_q,
-                    "R_ema_scale": self.R_ema_scale,
-                })
+            if self.curvature_mode == "low_rank":
+                if self._tracks_left:
+                    d["L_sketch"] = self.L_sketch
+                if self._tracks_right:
+                    d["R_sketch"] = self.R_sketch
+            elif self.use_int8_ema:
+                if self._tracks_left:
+                    d.update({"L_ema_q": self.L_ema_q, "L_ema_scale": self.L_ema_scale})
+                if self._tracks_right:
+                    d.update({"R_ema_q": self.R_ema_q, "R_ema_scale": self.R_ema_scale})
             else:
-                d.update({
-                    "L_ema": self.L_ema,
-                    "R_ema": self.R_ema,
-                })
+                if self._tracks_left:
+                    d["L_ema"] = self.L_ema
+                if self._tracks_right:
+                    d["R_ema"] = self.R_ema
             d.update({
                 "U_l": self.U_l,
                 "S_l": self.S_l,
@@ -614,22 +748,49 @@ class SparsePreconditioner:
         if self.use_block_diagonal:
             return sum(blk.memory_bytes() for blk in self._blocks)
         if self.use_kronecker:
-            if self.use_int8_ema:
+            if self.curvature_mode == "low_rank":
+                if self._tracks_left:
+                    total += self.L_sketch.numel() * self.L_sketch.element_size()
+                if self._tracks_right:
+                    total += self.R_sketch.numel() * self.R_sketch.element_size()
+            elif self.use_int8_ema:
                 # int8 EMA: 1 byte/element (int8) + 8 bytes scale per factor (Python float64)
-                total += self.L_ema_q.numel() + 8
-                total += self.R_ema_q.numel() + 8
+                if self._tracks_left:
+                    total += self.L_ema_q.numel() + 8
+                if self._tracks_right:
+                    total += self.R_ema_q.numel() + 8
             else:
-                total += self.L_ema.numel() * self.L_ema.element_size()
-                total += self.R_ema.numel() * self.R_ema.element_size()
+                if self._tracks_left:
+                    total += self.L_ema.numel() * self.L_ema.element_size()
+                if self._tracks_right:
+                    total += self.R_ema.numel() * self.R_ema.element_size()
             for t in (self.U_l, self.S_l, self.U_r, self.S_r):
                 total += t.numel() * t.element_size()
-            for t in (self.S_l_inv4, self.S_r_inv4, self.S_l_inv2, self.S_r_inv2):
+            for t in (
+                self.S_l_inv4,
+                self.S_r_inv4,
+                self.S_l_inv2,
+                self.S_r_inv2,
+                self.S_l_correction,
+                self.S_r_correction,
+            ):
                 total += t.numel() * t.element_size()
         else:
             total += self.diag_ema.numel() * self.diag_ema.element_size()
         return total
 
     def load_state_dict(self, state: dict) -> None:
+        state_mode = state.get("factor_mode", "full")
+        if state_mode != self.factor_mode:
+            raise ValueError(
+                f"Cannot load factor_mode={state_mode!r} into factor_mode={self.factor_mode!r}"
+            )
+        state_curvature_mode = state.get("curvature_mode", "dense")
+        if state_curvature_mode != self.curvature_mode:
+            raise ValueError(
+                "Cannot load curvature_mode="
+                f"{state_curvature_mode!r} into curvature_mode={self.curvature_mode!r}"
+            )
         self.precond_step = state["precond_step"]
         # Assign _k directly to avoid the setter's truncation logic during load;
         # eigenfactors are restored to exactly the saved shape below.
@@ -638,14 +799,27 @@ class SparsePreconditioner:
             for blk, blk_state in zip(self._blocks, state["blocks"], strict=True):
                 blk.load_state_dict(blk_state)
         elif self.use_kronecker:
-            if self.use_int8_ema:
-                self.L_ema_q = state["L_ema_q"].to(device=self.device, dtype=torch.int8)
-                self.L_ema_scale = float(state["L_ema_scale"])
-                self.R_ema_q = state["R_ema_q"].to(device=self.device, dtype=torch.int8)
-                self.R_ema_scale = float(state["R_ema_scale"])
+            if self.curvature_mode == "low_rank":
+                if self._tracks_left:
+                    self.L_sketch = state["L_sketch"].to(
+                        device=self.device, dtype=_PRECOND_DTYPE
+                    )
+                if self._tracks_right:
+                    self.R_sketch = state["R_sketch"].to(
+                        device=self.device, dtype=_PRECOND_DTYPE
+                    )
+            elif self.use_int8_ema:
+                if self._tracks_left:
+                    self.L_ema_q = state["L_ema_q"].to(device=self.device, dtype=torch.int8)
+                    self.L_ema_scale = float(state["L_ema_scale"])
+                if self._tracks_right:
+                    self.R_ema_q = state["R_ema_q"].to(device=self.device, dtype=torch.int8)
+                    self.R_ema_scale = float(state["R_ema_scale"])
             else:
-                self.L_ema.copy_(state["L_ema"])
-                self.R_ema.copy_(state["R_ema"])
+                if self._tracks_left:
+                    self.L_ema.copy_(state["L_ema"])
+                if self._tracks_right:
+                    self.R_ema.copy_(state["R_ema"])
             # Eigenfactors are always stored in _PRECOND_DTYPE (float32)
             self.U_l = state["U_l"].to(device=self.device, dtype=_PRECOND_DTYPE)
             self.S_l = state["S_l"].to(device=self.device, dtype=_PRECOND_DTYPE)
@@ -708,17 +882,37 @@ def _broadcast_precond(
             precond.S_r = torch.empty(k_new, dtype=_PRECOND_DTYPE, device=precond.device)
 
         # Broadcast EMA accumulators.
-        if precond.use_int8_ema:
-            dist.broadcast(precond.L_ema_q, src=0, group=process_group)
-            dist.broadcast(precond.R_ema_q, src=0, group=process_group)
-            # Scale factors are Python floats; wrap as tensors for broadcast.
-            for attr in ("L_ema_scale", "R_ema_scale"):
-                t = torch.tensor([getattr(precond, attr)], device=precond.device)
+        if precond.curvature_mode == "low_rank":
+            if precond._tracks_left:
+                dist.broadcast(precond.L_sketch, src=0, group=process_group)
+            if precond._tracks_right:
+                dist.broadcast(precond.R_sketch, src=0, group=process_group)
+        elif precond.use_int8_ema:
+            if precond._tracks_left:
+                dist.broadcast(precond.L_ema_q, src=0, group=process_group)
+            if precond._tracks_right:
+                dist.broadcast(precond.R_ema_q, src=0, group=process_group)
+            # Keep scale factors on-device after synchronization so subsequent
+            # fallback EMA updates avoid a host round trip.
+            scale_attrs = []
+            if precond._tracks_left:
+                scale_attrs.append("L_ema_scale")
+            if precond._tracks_right:
+                scale_attrs.append("R_ema_scale")
+            for attr in scale_attrs:
+                value = getattr(precond, attr)
+                t = (
+                    value.reshape(1)
+                    if isinstance(value, Tensor)
+                    else torch.tensor([value], device=precond.device)
+                )
                 dist.broadcast(t, src=0, group=process_group)
-                setattr(precond, attr, float(t.item()))
+                setattr(precond, attr, t.squeeze(0))
         else:
-            dist.broadcast(precond.L_ema, src=0, group=process_group)
-            dist.broadcast(precond.R_ema, src=0, group=process_group)
+            if precond._tracks_left:
+                dist.broadcast(precond.L_ema, src=0, group=process_group)
+            if precond._tracks_right:
+                dist.broadcast(precond.R_ema, src=0, group=process_group)
 
         # Broadcast eigenfactors (in-place: tensors already have the right shape).
         dist.broadcast(precond.U_l, src=0, group=process_group)
