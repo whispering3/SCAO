@@ -2682,7 +2682,7 @@ wheels = [
 
 [[package]]
 name = "scao"
-version = "0.2.4"
+version = "0.2.5"
 source = { editable = "." }
 dependencies = [
     { name = "torch", version = "2.14.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },

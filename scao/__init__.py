@@ -41,7 +41,7 @@ from .preconditioner import SparsePreconditioner
 from .presets import scao_3b_low_memory
 from .utils import adaptive_rank, matrix_power_neg_quarter
 
-__version__ = "0.2.4"
+__version__ = "0.2.5"
 __author__ = "Danilo Souza"
 __license__ = "Apache-2.0"
 

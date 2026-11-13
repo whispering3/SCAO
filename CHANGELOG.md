@@ -5,6 +5,15 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.2.5] — 2026-11-13
+
+### Fixed
+- **Publication version**: advances the package version after confirming that
+  `0.2.4` is already registered on PyPI, so the production-ready distribution
+  can be uploaded without a version-collision rejection.
+
+---
+
 ## [0.2.4] — 2026-11-12
 
 ### Added
