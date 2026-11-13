@@ -1,5 +1,8 @@
 name: CI
 
+permissions:
+  contents: read
+
 on:
   push:
     branches: [main, dev]
@@ -16,10 +19,10 @@ jobs:
         python-version: ["3.10", "3.11", "3.12", "3.13"]
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: ${{ matrix.python-version }}
           cache: pip
@@ -37,13 +40,13 @@ jobs:
         run: mypy scao/ --ignore-missing-imports --exclude 'scao/(benchmarks|tests|cuda)'
 
       - name: Run tests
-        run: pytest scao/tests/ -v --tb=short --cov=scao --cov-report=xml --ignore=scao/tests/test_profiling.py --ignore=scao/tests/test_ddp.py
+        run: pytest scao/tests/ -v --tb=short --cov=scao --cov-report=xml --cov-fail-under=70 --ignore=scao/tests/test_profiling.py --ignore=scao/tests/test_ddp.py
 
       - name: DDP tests (gloo / CPU, 2 processes)
         run: pytest scao/tests/test_ddp.py -v --tb=short
 
       - name: Upload coverage
-        uses: codecov/codecov-action@v4
+        uses: codecov/codecov-action@b9fd7d16f6d7d1b5d2bec1a2887e65ceed900238 # v4
         with:
           files: coverage.xml
           fail_ci_if_error: false
@@ -52,10 +55,10 @@ jobs:
     name: "Test · Windows · Python 3.11"
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Set up Python 3.11
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: "3.11"
           cache: pip
@@ -73,8 +76,8 @@ jobs:
     name: "Benchmark smoke test"
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: "3.11"
           cache: pip
@@ -85,14 +88,26 @@ jobs:
       - name: Run quick benchmark
         run: |
           python scao/benchmarks/gpt_scale_benchmark.py             --scales tiny --steps 30 --optimizers "adamw,scao"             --seeds "42" --csv /tmp/smoke.csv
+      - name: Check packaged runtime
+        run: scao-doctor
+      - name: Measure preconditioner paths
+        run: |
+          scao-preconditioner-bench --device cpu --dim 128 --rank 16 --warmup 1 --iters 3 --operation all --json /tmp/scao-microbench.json | tee /tmp/scao-microbench.txt
+      - name: Upload benchmark report
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: cpu-microbenchmark
+          path: |
+            /tmp/scao-microbench.txt
+            /tmp/scao-microbench.json
 
   build:
     name: "Build distribution"
     runs-on: ubuntu-latest
     needs: [test]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: "3.11"
       - name: Build wheel and sdist
@@ -104,7 +119,7 @@ jobs:
           pip install twine
           twine check dist/*
       - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: dist
           path: dist/

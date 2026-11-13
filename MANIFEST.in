@@ -1,6 +1,8 @@
 include LICENSE
 include README.md
 include CHANGELOG.md
+include SECURITY.md
+include SUPPORT.md
 include pyproject.toml
 
 recursive-include scao *.py *.cu *.h

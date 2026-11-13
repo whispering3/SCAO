@@ -5,7 +5,27 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
-## [0.2.4] — Unreleased
+## [0.2.4] — 2026-11-12
+
+### Added
+- **Production readiness tooling**: added `scao-doctor`, a typed
+  `SCAOConfig` API, split optional installation extras, and a reproducible
+  `uv.lock` environment for Python 3.10–3.13.
+- **Benchmark records**: `scao-preconditioner-bench --json` now produces
+  machine-readable latency results for automated regression comparison.
+- **Quality and support policy**: added core-library coverage enforcement,
+  dependency reproducibility, security reporting, and user support guidance.
+- **Experimental low-rank sketches**: enabled the opt-in
+  `curvature_mode="low_rank"` path with checkpoint round-trip coverage. Dense
+  curvature remains the default and recommended production path.
+
+### Changed
+- **Default-step latency**: the optimizer avoids host synchronizations for
+  global and per-layer gradient norms unless an adaptive feature needs them.
+- **Curvature refreshes**: spectral regularization remains on the device,
+  avoiding `.item()` synchronization during CUDA preconditioner updates.
+- **Safer defaults**: the maximum dense curvature block is now 2048 instead
+  of 4096, reducing worst-case memory and eigendecomposition cost.
 
 ### Fixed
 - **Fair QLoRA comparisons**: the 3B benchmark now runs AdamW and SCAO with
@@ -34,9 +54,9 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **AdamW update rule**: SCAO now applies its preconditioned gradient through
   AdamW moments, removing the two full-size Adan buffers from optimizer state.
   The supported path now uses AdamW moments exclusively.
-- **Supported curvature path**: the public optimizer and benchmark use dense
-  curvature EMA only. Experimental covariance-sketch settings are rejected so
-  production runs cannot select an unvalidated algorithm.
+- **Supported curvature path**: dense curvature EMA remains the default
+  production path. The covariance-sketch path is explicitly opt-in and emits
+  an experimental-use warning.
 - **Reproducible benchmark records**: the QLoRA benchmark now saves per-run
   JSON with effective settings, environment metadata, dataset fingerprints,
   measurements, model revision, and a SCAO source fingerprint for ZIP-based

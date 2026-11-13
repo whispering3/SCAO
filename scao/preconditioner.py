@@ -110,7 +110,7 @@ class SparsePreconditioner:
         k_min: int = 8,
         k_max: int = 128,
         rho: float = 0.999,
-        max_precond_dim: int = 4096,
+        max_precond_dim: int = 2048,
         use_newton_schulz: bool = False,
         use_int8_ema: bool = False,
         factor_mode: str = "full",
@@ -128,14 +128,27 @@ class SparsePreconditioner:
         self.original_shape = shape
         self.m = m
         self.n = n
+        if not 0.0 <= epsilon_sparse < 1.0:
+            raise ValueError(f"epsilon_sparse must be in [0, 1), got {epsilon_sparse}")
+        if k_min < 1:
+            raise ValueError(f"k_min must be >= 1, got {k_min}")
+        if k_max < k_min:
+            raise ValueError(f"k_max must be >= k_min, got k_min={k_min}, k_max={k_max}")
+        if not 0.0 <= rho < 1.0:
+            raise ValueError(f"rho must be in [0, 1), got {rho}")
+        if max_precond_dim < 2:
+            raise ValueError(f"max_precond_dim must be >= 2, got {max_precond_dim}")
         self.epsilon_sparse = epsilon_sparse
         if factor_mode not in {"full", "wide"}:
             raise ValueError("factor_mode must be 'full' or 'wide'")
-        if curvature_mode != "dense" or curvature_rank is not None:
+        if curvature_mode not in {"dense", "low_rank"}:
             raise ValueError(
-                "Only the stable dense curvature path is supported; "
-                "use curvature_mode='dense' and curvature_rank=None"
+                "curvature_mode must be 'dense' or 'low_rank'"
             )
+        if curvature_mode == "dense" and curvature_rank is not None:
+            raise ValueError("curvature_rank is only valid with curvature_mode='low_rank'")
+        if curvature_rank is not None and curvature_rank < 1:
+            raise ValueError(f"curvature_rank must be positive, got {curvature_rank}")
         self.factor_mode = factor_mode
         self.curvature_mode = curvature_mode
         # ``wide`` is intended for rectangular LoRA adapters. For a square
@@ -458,8 +471,10 @@ class SparsePreconditioner:
         If ``B @ B.T`` approximates the prior covariance, concatenating
         ``sqrt(rho) * B`` with ``sqrt(alpha) * G`` represents the next EMA
         before truncation. A thin SVD keeps only ``curvature_rank`` columns.
-        This turns dense covariance storage and eigendecomposition into a
-        bounded low-rank update suitable for rectangular LoRA matrices.
+        This avoids dense covariance storage (the dominant memory cost of the
+        dense path) and is suitable for rectangular LoRA matrices.  It remains
+        an experimental approximation: benchmark it against ``dense`` for the
+        target workload before using it in a production training run.
         """
         sample = gradient if left else gradient.T
         candidate = torch.cat((sketch * math.sqrt(self.rho), sample * math.sqrt(alpha)), dim=1)
@@ -495,7 +510,9 @@ class SparsePreconditioner:
         eps = 1e-8
         def eig_factor(ema: Tensor, dim: int) -> tuple[Tensor, Tensor]:
             debiased = ema / max(bias_factor, eps)
-            regularizer = max(eps, 1e-4 * debiased.trace().item() / dim)
+            # Keep this scalar as a device tensor.  Calling ``.item()`` here
+            # synchronizes the CUDA stream and defeats async curvature updates.
+            regularizer = (debiased.trace() * (1e-4 / dim)).clamp_min(eps)
             matrix = debiased.clone()
             matrix.diagonal().add_(regularizer)
             try:
@@ -510,7 +527,7 @@ class SparsePreconditioner:
         ) -> tuple[Tensor, Tensor]:
             spectrum, vectors = factor
             spectrum = spectrum / max(bias_factor, eps)
-            regularizer = max(eps, 1e-4 * spectrum.sum().item() / dim)
+            regularizer = (spectrum.sum() * (1e-4 / dim)).clamp_min(eps)
             return spectrum.add(regularizer), vectors
 
         # Preserve CPU RNG state so preconditioner updates do not perturb

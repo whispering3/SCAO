@@ -27,6 +27,7 @@ Zenodo 2026
 """
 
 from . import logging as scao_logging
+from .config import SCAOConfig
 from .optimizer import (
     SCAO,
     scao_1b,
@@ -47,6 +48,7 @@ __license__ = "Apache-2.0"
 __all__ = [
     # Main API — this is all most users need
     "SCAO",
+    "SCAOConfig",
     "scao_sub1b", "scao_1b", "scao_3b", "scao_3b_low_memory", "scao_7b", "scao_40b", "scao_125b",
     # Advanced / internals
     "SparsePreconditioner",

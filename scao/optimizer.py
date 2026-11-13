@@ -111,7 +111,7 @@ class SCAO(Optimizer):
         warmup_steps: int = 100,
         blend_steps: int = 50,
         min_precond_updates: int = 2,
-        max_precond_dim: int = 4096,
+        max_precond_dim: int = 2048,
         use_newton_schulz: bool = False,
         use_int8_ema: bool = False,
         async_precond: bool = True,
@@ -142,6 +142,10 @@ class SCAO(Optimizer):
     ) -> None:
         if lr < 0:
             raise ValueError(f"Invalid lr: {lr}")
+        if eps <= 0:
+            raise ValueError(f"eps must be positive, got {eps}")
+        if weight_decay < 0:
+            raise ValueError(f"weight_decay must be non-negative, got {weight_decay}")
         if not (0.0 <= betas[0] < 1.0):
             raise ValueError(f"Invalid beta1: {betas[0]}")
         if not (0.0 <= betas[1] < 1.0):
@@ -150,6 +154,18 @@ class SCAO(Optimizer):
             raise ValueError(f"Invalid beta3: {beta3}")
         if precond_freq < 1:
             raise ValueError(f"precond_freq must be >= 1, got {precond_freq}")
+        if k_min < 1:
+            raise ValueError(f"k_min must be >= 1, got {k_min}")
+        if k_max < k_min:
+            raise ValueError(f"k_max must be >= k_min, got k_min={k_min}, k_max={k_max}")
+        if max_precond_dim < 2:
+            raise ValueError(f"max_precond_dim must be >= 2, got {max_precond_dim}")
+        if not 0.0 <= rho < 1.0:
+            raise ValueError(f"rho must be in [0, 1), got {rho}")
+        if warmup_steps < 0 or blend_steps < 0:
+            raise ValueError("warmup_steps and blend_steps must be non-negative")
+        if tau is not None and tau <= 0:
+            raise ValueError(f"tau must be positive or None, got {tau}")
         if min_precond_updates < 0:
             raise ValueError(
                 f"min_precond_updates must be >= 0, got {min_precond_updates}"
@@ -162,10 +178,20 @@ class SCAO(Optimizer):
             raise ValueError("factor_mode must be 'full' or 'wide'")
         if update_rule != "adamw":
             raise ValueError("Only the stable update_rule='adamw' is supported")
-        if curvature_mode != "dense" or curvature_rank is not None:
+        if curvature_mode not in {"dense", "low_rank"}:
             raise ValueError(
-                "Only the stable dense curvature path is supported; "
-                "use curvature_mode='dense' and curvature_rank=None"
+                "curvature_mode must be 'dense' or 'low_rank'"
+            )
+        if curvature_mode == "dense" and curvature_rank is not None:
+            raise ValueError("curvature_rank is only valid with curvature_mode='low_rank'")
+        if curvature_rank is not None and curvature_rank < 1:
+            raise ValueError(f"curvature_rank must be positive, got {curvature_rank}")
+        if curvature_mode == "low_rank":
+            warnings.warn(
+                "curvature_mode='low_rank' is experimental; compare it against "
+                "the default dense mode before production use.",
+                UserWarning,
+                stacklevel=2,
             )
 
         defaults = {
@@ -308,10 +334,16 @@ class SCAO(Optimizer):
     # -----------------------------------------------------------------------
 
     def _compute_avg_grad_norm(self) -> float:
-        norms = [float(p.grad.norm()) for g in self.param_groups for p in g["params"] if p.grad is not None]
+        """Return a mean gradient norm with a single device-to-host sync.
+
+        This value is only needed by opt-in adaptive features.  Keeping the
+        reduction on the device until the final ``item`` avoids one CUDA
+        synchronization per parameter tensor.
+        """
+        norms = [p.grad.norm() for g in self.param_groups for p in g["params"] if p.grad is not None]
         if not norms:
             return 0.0
-        avg = sum(norms) / len(norms)
+        avg = float(torch.stack(norms).mean())
         # Slow EMA avoids overreaction to single noisy batches
         self._global_norm_ema = 0.95 * self._global_norm_ema + 0.05 * avg
         return avg
@@ -346,8 +378,13 @@ class SCAO(Optimizer):
 
         self._global_step += 1
 
-        # Compute before iterating params so R2/R5 filters see a consistent ref
-        avg_norm = self._compute_avg_grad_norm()
+        # The default optimizer path does not use aggregate gradient norms.
+        # Avoid a host synchronization per step unless an opt-in adaptive
+        # feature explicitly needs the reference value.
+        needs_global_grad_norm = (
+            self._dynamic_sparsity or self._adaptive_warmup or self._adaptive_rank
+        )
+        avg_norm = self._compute_avg_grad_norm() if needs_global_grad_norm else 0.0
 
         if self._dynamic_sparsity:
             for f in self._sparse_filters.values():
@@ -419,7 +456,10 @@ class SCAO(Optimizer):
             pid  = id(p)
 
             grad = p.grad.float()
-            grad_norm = float(grad.norm())
+            # A scalar norm synchronizes CUDA with the host.  It is only used
+            # by adaptive-rank and lazy-preconditioner scheduling, both opt-in.
+            needs_layer_grad_norm = self._adaptive_rank or self._lazy_precond
+            grad_norm = float(grad.norm()) if needs_layer_grad_norm else 0.0
 
             # Optional research features are deliberately opt-in.  In particular,
             # absolute noise is unsafe for LoRA gradients, whose scale is often

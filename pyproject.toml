@@ -7,7 +7,7 @@ name = "scao"
 version = "0.2.4"
 description = "Sparse curvature-aware optimizer for PyTorch"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.10,<3.14"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
 keywords = [
@@ -44,11 +44,13 @@ Paper = "https://doi.org/10.5281/zenodo.19839495"
 scao-scale-planner = "scao.tools.scale_planner:main"
 scao-preconditioner-bench = "scao.tools.preconditioner_microbench:main"
 scao-build-cuda = "scao.cuda.build:main"
+scao-doctor = "scao.tools.doctor:main"
 
 [project.optional-dependencies]
 dev = [
   "pytest>=7.0",
   "pytest-cov",
+  "numpy>=1.26",
   "mypy>=1.5",
   "ruff>=0.1",
   "build",
@@ -57,12 +59,22 @@ dev = [
 cuda = [
   "torch>=2.0.0",
 ]
+transformers = [
+  "transformers>=4.30.0",
+  "datasets>=2.0.0",
+  "accelerate",
+]
+lora = [
+  "peft",
+  "bitsandbytes",
+]
+# Backwards-compatible convenience extra.
 hf = [
   "transformers>=4.30.0",
   "datasets>=2.0.0",
+  "accelerate",
   "peft",
   "bitsandbytes",
-  "accelerate",
 ]
 all = [
   "transformers>=4.30.0",
@@ -88,6 +100,17 @@ python_files = ["test_*.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]
 addopts = "-v --tb=short"
+
+[tool.coverage.report]
+# The quality gate tracks distributable library code. Tests, standalone
+# benchmarks, CUDA build helpers, and command-line tools are exercised in
+# dedicated CI jobs instead of diluting the core-library signal.
+omit = [
+  "scao/tests/*",
+  "scao/benchmarks/*",
+  "scao/cuda/*",
+  "scao/tools/*",
+]
 
 [tool.mypy]
 python_version = "3.10"

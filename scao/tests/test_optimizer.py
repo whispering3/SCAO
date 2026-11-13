@@ -77,6 +77,43 @@ class TestSCAOBasic:
             SCAO(model.parameters(), sparsity=1.0)
         with pytest.raises(ValueError, match="noise_std_init"):
             SCAO(model.parameters(), noise_std_init=-0.1)
+        with pytest.raises(ValueError, match="eps"):
+            SCAO(model.parameters(), eps=0.0)
+        with pytest.raises(ValueError, match="k_max"):
+            SCAO(model.parameters(), k_min=8, k_max=4)
+        with pytest.raises(ValueError, match="max_precond_dim"):
+            SCAO(model.parameters(), max_precond_dim=1)
+        with pytest.raises(ValueError, match="rho"):
+            SCAO(model.parameters(), rho=1.0)
+        with pytest.raises(ValueError, match="tau"):
+            SCAO(model.parameters(), tau=0.0)
+
+    def test_default_step_skips_optional_global_norm_reduction(self, monkeypatch):
+        """Default settings must not pay for adaptive-feature norm reduction."""
+        model = nn.Linear(4, 2)
+        optimizer = SCAO(model.parameters(), async_precond=False)
+
+        def unexpected_norm_reduction():
+            raise AssertionError("default optimizer path should not compute a global grad norm")
+
+        monkeypatch.setattr(optimizer, "_compute_avg_grad_norm", unexpected_norm_reduction)
+        model(torch.randn(2, 4)).sum().backward()
+        optimizer.step()
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+    def test_async_preconditioner_smoke(self):
+        """The asynchronous CUDA path completes and leaves parameters finite."""
+        model = nn.Linear(16, 8, device="cuda")
+        optimizer = SCAO(
+            model.parameters(), lr=1e-3, warmup_steps=1, precond_freq=1,
+            max_precond_dim=32, k_max=4, async_precond=True,
+        )
+        for _ in range(3):
+            optimizer.zero_grad()
+            model(torch.randn(4, 16, device="cuda")).square().mean().backward()
+            optimizer.step()
+        optimizer.synchronize_precond()
+        assert all(torch.isfinite(param).all() for param in model.parameters())
 
     def test_relative_noise_scales_with_gradient_rms(self):
         model = nn.Linear(2, 2)
@@ -841,20 +878,39 @@ class TestBlockDiagonal:
         restored.load_state_dict(wide.state_dict())
         assert torch.allclose(output, restored.precondition(gradient), atol=1e-5)
 
-    def test_low_rank_curvature_mode_is_rejected(self):
-        """The supported optimizer path uses only the dense curvature EMA."""
+    def test_low_rank_curvature_mode_round_trip(self):
+        """Low-rank sketches are finite, memory-bounded, and checkpointable."""
         from scao.preconditioner import SparsePreconditioner
 
         parameter = torch.randn(256, 16)
-        with pytest.raises(ValueError, match="stable dense curvature"):
-            SparsePreconditioner(
-                parameter,
-                max_precond_dim=256,
-                k_min=8,
-                use_int8_ema=True,
-                factor_mode="wide",
-                curvature_mode="low_rank",
-            )
+        low_rank = SparsePreconditioner(
+            parameter,
+            max_precond_dim=256,
+            k_min=8,
+            k_max=16,
+            factor_mode="wide",
+            curvature_mode="low_rank",
+            curvature_rank=12,
+        )
+        gradient = torch.randn_like(parameter)
+        low_rank.update_curvature(gradient)
+        output = low_rank.precondition(gradient)
+
+        assert torch.isfinite(output).all()
+        assert low_rank.L_sketch.shape[1] == 12
+        assert not hasattr(low_rank, "L_ema")
+
+        restored = SparsePreconditioner(
+            parameter,
+            max_precond_dim=256,
+            k_min=8,
+            k_max=16,
+            factor_mode="wide",
+            curvature_mode="low_rank",
+            curvature_rank=12,
+        )
+        restored.load_state_dict(low_rank.state_dict())
+        assert torch.allclose(output, restored.precondition(gradient), atol=1e-5)
 
     def test_optimizer_with_large_layer(self):
         """SCAO optimizer step must work end-to-end on a model with large layers."""

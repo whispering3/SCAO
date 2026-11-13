@@ -15,14 +15,35 @@ multi-seed experiments before changing a production training configuration.
 
 ## Installation
 
+SCAO supports Python 3.10 through 3.13. Create an isolated environment first:
+
+```bash
+python -m venv .venv
+# Windows: .venv\\Scripts\\activate
+# Linux/macOS: source .venv/bin/activate
+python -m pip install --upgrade pip
+```
+
+Install the core optimizer:
+
 ```bash
 pip install scao
 ```
 
-Hugging Face and QLoRA dependencies are optional:
+Install only the integration you need. Hugging Face training support does not
+require GPU-specific LoRA dependencies:
 
 ```bash
-pip install "scao[hf]"
+pip install "scao[transformers]"  # Trainer, datasets, scheduler integration
+pip install "scao[lora]"          # PEFT and bitsandbytes for LoRA/QLoRA
+```
+
+`scao[hf]` remains available as a backwards-compatible shortcut that installs
+both sets. After installation, check the environment and run a small optimizer
+smoke test:
+
+```bash
+scao-doctor
 ```
 
 For development:
@@ -52,6 +73,31 @@ for batch in dataloader:
     loss = model(**batch).loss
     loss.backward()
     optimizer.step()
+```
+
+For a smaller, typed configuration surface, use `SCAOConfig`:
+
+```python
+from scao import SCAOConfig
+
+optimizer = SCAOConfig.for_lora(lr=2e-4).build(trainable_params)
+```
+
+`SCAOConfig` covers the common training controls. Pass advanced options to
+`build`, or use `SCAO(...)` directly when running an ablation.
+
+For very large rectangular adapters, an experimental low-rank curvature sketch
+avoids retaining dense covariance matrices. It reduces optimizer-state memory,
+but changes the approximation and must be benchmarked against the default
+`dense` mode on the target workload:
+
+```python
+optimizer = SCAO(
+    trainable_params,
+    curvature_mode="low_rank",
+    curvature_rank=32,
+    factor_mode="wide",
+)
 ```
 
 The initial warmup uses Adam-style moments. SCAO can use its curvature
@@ -137,6 +183,9 @@ installing SCAO:
 ```bash
 scao-build-cuda
 ```
+
+Run `scao-doctor --build-cuda` to compile and validate the extension in one
+step. Add `--strict-cuda` when a fallback implementation is not acceptable.
 
 SCAO emits a warning and uses the PyTorch fallback if the extension is absent.
 The supported optimizer path uses the same PyTorch Kronecker application on
@@ -283,7 +332,7 @@ For a multi-scale H100 evidence set and paired-report procedure, follow
 | `min_precond_updates` | `2` | Curvature updates required before phase two. |
 | `precond_freq` | `20` | Curvature update interval in optimizer steps. |
 | `k_min`, `k_max` | `8`, `128` | Bounds for adaptive low-rank factors. |
-| `max_precond_dim` | `4096` | Maximum dimension of each curvature block. |
+| `max_precond_dim` | `2048` | Maximum dimension of each curvature block. Lower it for tighter memory/latency budgets. |
 | `use_int8_ema` | `False` | Stores EMA factors as int8 with scale metadata. |
 | `factor_mode` | `"full"` | `"wide"` tracks only the wide side of a rectangular matrix. |
 | `tau` | `1.0` | Natural-gradient norm cap; set `None` to disable. |
@@ -316,10 +365,14 @@ Run the local quality gates before opening a pull request:
 ```bash
 python -m ruff check .
 python -m mypy scao/ --ignore-missing-imports --exclude 'scao/(benchmarks|tests|cuda)'
-python -m pytest scao/tests/ -v --tb=short --ignore=scao/tests/test_profiling.py
+python -m pytest scao/tests/ -v --tb=short --cov=scao --cov-fail-under=70 --ignore=scao/tests/test_profiling.py
 python -m build
 python -m twine check dist/*
 ```
+
+`uv.lock` records the fully resolved development environment. With
+[uv](https://docs.astral.sh/uv/), reproduce it with `uv sync --extra dev` and
+run the gates through `uv run ...`.
 
 The CI matrix also runs the DDP tests and a CPU benchmark smoke test. GPU and
 QLoRA benchmarks require a separately provisioned CUDA environment.
@@ -346,3 +399,8 @@ Zenodo record: <https://doi.org/10.5281/zenodo.19839495>.
 ## License
 
 Apache License 2.0. See [LICENSE](LICENSE).
+
+## Support and security
+
+For bug reports and performance regressions, see [SUPPORT.md](SUPPORT.md).
+For private security reporting, see [SECURITY.md](SECURITY.md).
